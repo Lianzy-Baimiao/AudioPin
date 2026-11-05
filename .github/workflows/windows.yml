@@ -27,6 +27,8 @@ jobs:
           Copy-Item target/release/audiopin.exe dist/AudioPin/AudioPin.exe
           Copy-Item README.md,LICENSE,config.example.toml dist/AudioPin/
           Copy-Item scripts/Install.ps1,scripts/Uninstall.ps1 dist/AudioPin/
+          New-Item -ItemType Directory -Force dist/AudioPin/docs | Out-Null
+          Copy-Item docs/amd-protocol.md,docs/validation.md dist/AudioPin/docs/
           Compress-Archive -Path dist/AudioPin/* -DestinationPath dist/AudioPin-windows-x64.zip
           $hash = (Get-FileHash dist/AudioPin-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  AudioPin-windows-x64.zip" | Set-Content dist/SHA256SUMS.txt -Encoding ascii

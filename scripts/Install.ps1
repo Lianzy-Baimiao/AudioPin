@@ -10,6 +10,12 @@ foreach ($file in @('AudioPin.exe','README.md','LICENSE','config.example.toml','
     $item = Join-Path $PSScriptRoot $file
     if (Test-Path -LiteralPath $item) { Copy-Item -LiteralPath $item -Destination (Join-Path $installDir $file) -Force }
 }
+$docs = Join-Path $installDir 'docs'
+New-Item -ItemType Directory -Force -Path $docs | Out-Null
+foreach ($name in @('amd-protocol.md','validation.md')) {
+    $item = Join-Path $PSScriptRoot "docs\$name"
+    if (Test-Path -LiteralPath $item) { Copy-Item -LiteralPath $item -Destination (Join-Path $docs $name) -Force }
+}
 $shell = New-Object -ComObject WScript.Shell
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'AudioPin.lnk'
 $shortcut = $shell.CreateShortcut($shortcutPath)

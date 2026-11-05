@@ -10,7 +10,7 @@ if ($value -like ('"' + $exe + '"*')) { Remove-ItemProperty -LiteralPath $run -N
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'AudioPin.lnk'
 if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut }
 # Delete only known application files, never the data/config directory.
-foreach ($name in @('AudioPin.exe','README.md','LICENSE','config.example.toml','Uninstall.ps1')) {
+foreach ($name in @('AudioPin.exe','README.md','LICENSE','config.example.toml','Uninstall.ps1','docs\amd-protocol.md','docs\validation.md')) {
     $file = Join-Path $actual $name
     if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file }
 }
