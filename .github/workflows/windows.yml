@@ -1,0 +1,61 @@
+name: Windows build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/AudioPin | Out-Null
+          Copy-Item target/release/audiopin.exe dist/AudioPin/AudioPin.exe
+          Copy-Item README.md,LICENSE,config.example.toml dist/AudioPin/
+          Copy-Item scripts/Install.ps1,scripts/Uninstall.ps1 dist/AudioPin/
+          Compress-Archive -Path dist/AudioPin/* -DestinationPath dist/AudioPin-windows-x64.zip
+          $hash = (Get-FileHash dist/AudioPin-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  AudioPin-windows-x64.zip" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioPin-windows-x64
+          path: |
+            dist/AudioPin-windows-x64.zip
+            dist/SHA256SUMS.txt
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AudioPin-windows-x64
+          path: dist
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          gh release view $env:TAG_NAME 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $env:TAG_NAME --title "AudioPin $env:TAG_NAME" --generate-notes }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release upload $env:TAG_NAME dist/AudioPin-windows-x64.zip dist/SHA256SUMS.txt --clobber
+          exit $LASTEXITCODE

@@ -1,0 +1,6 @@
+/target/
+/dist/
+*.log
+*.local.*
+/diagnostics/
+/diagnostics*.json

@@ -1,0 +1,22 @@
+# Copy settings via the UI, or edit %LOCALAPPDATA%\AudioPin\config.toml then reload.
+# Device IDs are machine-specific. Select actual devices in the UI.
+schema_version = 1
+guard_enabled = true
+amd_enabled = true
+physical_input = ""
+output_input = ""
+pin_default = false
+pin_communications = false
+poll_seconds = 2
+retry_max_seconds = 60
+notifications = true
+notification_cooldown_seconds = 10
+autostart = false
+start_minimized = true
+close_to_tray = true
+restart_amd_if_missing = true
+apps = ["YY.exe", "KOOK.exe"]
+pin_apps = false
+update_repository = "Lianzy-Baimiao/AudioPin"
+auto_check_updates = false
+use_gh_auth = true
