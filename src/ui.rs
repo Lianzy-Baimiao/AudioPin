@@ -296,7 +296,7 @@ impl App {
         for (i, text) in [
             "守护概览",
             "设备与路由",
-            "语音软件",
+            "Windows 应用偏好",
             "偏好设置",
             "关于与更新",
         ]
@@ -371,9 +371,9 @@ impl App {
         self.checkbox(PIN_COMMS, 1, "固定 Windows 默认通信输入", 431);
         self.label(15,1,"提示：先确认 AMD 选中正确的原始麦克风。不要将降噪输出当作原始输入。\r\n暂停守护时，会尽可能还原本次运行修改过的系统与应用路由。",(210,493,680,70));
 
-        self.label(16, 2, "语音软件", (210, 31, 680, 40));
-        self.label(17,2,"固定指定进程的 Windows 音频输入路由。应用启动后自动应用。\r\n在 YY / KOOK 内选择“系统默认”或“默认通信设备”，必要时重进语音频道。",(210,82,680,65));
-        self.checkbox(PIN_APPS, 2, "启用应用输入守护", 158);
+        self.label(16, 2, "Windows 应用输入偏好", (210, 31, 680, 40));
+        self.label(17,2,"仅守护 Windows 为应用保存的首选输入设备。\r\nYY / KOOK 内部麦克风配置守护尚未实现；这两款软件的兼容效果未验证。",(210,82,680,65));
+        self.checkbox(PIN_APPS, 2, "守护 Windows 输入偏好（实验性）", 158);
         self.label(
             18,
             2,
@@ -387,7 +387,12 @@ impl App {
             (210, 241, 680, 130),
             ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL | ES_WANTRETURN as u32,
         );
-        self.label(19, 2, "当前应用状态", (210, 399, 680, 28));
+        self.label(
+            19,
+            2,
+            "Windows 偏好读回结果（应用实际输入未知）",
+            (210, 399, 680, 28),
+        );
         self.edit(
             APP_STATUS,
             2,
@@ -398,7 +403,7 @@ impl App {
         self.label(
             20,
             2,
-            "软件内部显式选定的麦克风可能优先于 Windows 路由；AudioPin 不修改聊天数据。",
+            "应用可能忽略此偏好。偏好值一致不能证明通话已使用目标麦克风。",
             (210, 557, 680, 40),
         );
 

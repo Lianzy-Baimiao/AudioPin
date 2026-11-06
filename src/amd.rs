@@ -13,6 +13,23 @@ use winreg::{enums::*, RegKey};
 const PROFILE_HASH: &str = "4ecec1b76d9ef18c7f2a26da823e71124db627e3acd3c178c89b80b3aeac20ee";
 const MAP_SIZE: usize = 0x29e08;
 const KEY: &str = r"Software\AMD\CN\Audio";
+#[derive(Debug)]
+struct BackendError(i32);
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == -2 {
+            write!(f, "AMD 音频处理引擎尚未初始化（-2）")
+        } else {
+            write!(f, "AMD 返回错误 {}", self.0)
+        }
+    }
+}
+impl std::error::Error for BackendError {}
+pub fn uninitialized(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BackendError>()
+        .is_some_and(|e| e.0 == -2)
+}
 pub fn executable() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
         .join(r"System32\AMD\ANR\AMDNoiseSuppression.exe")
@@ -107,12 +124,16 @@ impl Amd {
             })
         }
     }
-    fn request(&self, device: &str, enabled: Option<bool>) -> Result<bool> {
-        let id = wide(device);
-        if id.len() > 128 || device.is_empty() || device.contains('\0') {
-            bail!("AMD 设备 ID 超出协议范围");
+    fn request(&self, device: Option<&str>, enabled: Option<bool>) -> Result<bool> {
+        let id = device.map(wide);
+        if let Some(device) = device {
+            if id.as_ref().unwrap().len() > 128 || device.is_empty() || device.contains('\0') {
+                bail!("AMD 设备 ID 超出协议范围");
+            }
         }
-        let (command, offset, result) = if enabled.is_some() {
+        let (command, offset, result) = if device.is_none() {
+            (0x82u32, 0x828, 0x828)
+        } else if enabled.is_some() {
             (0x87u32, 0x978, 0xa7c)
         } else {
             (0x86, 0x868, 0x96c)
@@ -140,8 +161,10 @@ impl Amd {
             let _lock = Lock(mutex);
             let p = self.view.Value.cast::<u8>();
             // Only touch the verified command's fields. Never create or resize AMD's map.
-            ptr::write_bytes(p.add(offset), 0, 256);
-            ptr::copy_nonoverlapping(id.as_ptr().cast::<u8>(), p.add(offset), id.len() * 2);
+            if let Some(id) = &id {
+                ptr::write_bytes(p.add(offset), 0, 256);
+                ptr::copy_nonoverlapping(id.as_ptr().cast::<u8>(), p.add(offset), id.len() * 2);
+            }
             if let Some(state) = enabled {
                 ptr::write_volatile(p.add(offset + 256), u8::from(state));
             }
@@ -170,22 +193,29 @@ impl Amd {
                 }
                 WaitForSingleObject(self.done.0, 50);
             }
-            let returned = std::slice::from_raw_parts(p.add(offset).cast::<u16>(), id.len());
-            if returned != id {
-                bail!("AMD 响应设备不匹配，将稍后重试");
+            if let Some(id) = &id {
+                let returned = std::slice::from_raw_parts(p.add(offset).cast::<u16>(), id.len());
+                if returned != id {
+                    bail!("AMD 响应设备不匹配，将稍后重试");
+                }
             }
             let rc = ptr::read_volatile(p.add(result).cast::<i32>());
-            if rc != 0 {
-                bail!("AMD 返回错误 {rc}，设备可能已断开");
+            // START_PROCESS returns 1 when already initialized. Other commands
+            // still require 0; do not generalize all positive codes as success.
+            if rc != 0 && !(command == 0x82 && rc == 1) {
+                return Err(BackendError(rc).into());
             }
-            Ok(ptr::read_volatile(p.add(offset + 256)) == 1)
+            Ok(device.is_none() || ptr::read_volatile(p.add(offset + 256)) == 1)
         }
     }
     pub fn state(&self, device: &str) -> Result<bool> {
-        self.request(device, None)
+        self.request(Some(device), None)
+    }
+    pub fn initialize(&self) -> Result<()> {
+        self.request(None, None).map(|_| ())
     }
     pub fn enable(&self, device: &str) -> Result<()> {
-        self.request(device, Some(true))?;
+        self.request(Some(device), Some(true))?;
         if !self.state(device)? {
             bail!("AMD 接收了开启命令，但运行状态仍为关闭");
         }

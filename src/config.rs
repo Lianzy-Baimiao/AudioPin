@@ -44,7 +44,7 @@ impl Default for Config {
             start_minimized: true,
             close_to_tray: true,
             restart_amd_if_missing: true,
-            apps: vec!["YY.exe".into(), "KOOK.exe".into()],
+            apps: Vec::new(),
             pin_apps: false,
             update_repository: "Lianzy-Baimiao/AudioPin".into(),
             auto_check_updates: false,

@@ -1,10 +1,21 @@
-"""Local AMD protocol probe; reads state only unless --recover is supplied."""
-import ctypes as c, struct, winreg, sys, hashlib, time
+"""Read AMD state, or explicitly inject an IPC fault and verify live capture recovery."""
+import argparse, ctypes as c, json, os, subprocess, winreg, hashlib, time
 from pathlib import Path
+parser = argparse.ArgumentParser(description=__doc__)
+mode = parser.add_mutually_exclusive_group()
+mode.add_argument('--recover', action='store_true')
+mode.add_argument('--test-watchdog', action='store_true')
+parser.add_argument('--diagnose-exe', type=Path, default=Path(os.environ['LOCALAPPDATA']) / 'Programs/AudioPin/AudioPin.exe')
+args = parser.parse_args()
+def capture_active():
+ subprocess.run([str(args.diagnose_exe), '--diagnose'], check=True, timeout=15, stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+ report = json.loads((Path(os.environ['LOCALAPPDATA']) / 'AudioPin/diagnostics.json').read_text(encoding='utf-8'))
+ assert 'amd_capture_active' in report, 'Requires AudioPin 0.1.1 or newer diagnostics'
+ return report['amd_capture_active'] is True and report['amd_runtime_enabled'] == 'true'
 assert hashlib.sha256(Path(r'C:\Windows\System32\AMD\ANR\AMDNoiseSuppression.exe').read_bytes()).hexdigest() == '4ecec1b76d9ef18c7f2a26da823e71124db627e3acd3c178c89b80b3aeac20ee', 'Unverified AMD binary; refusing IPC'
 k=c.WinDLL('kernel32',use_last_error=True)
-for name,args,ret in [('CreateMutexW',[c.c_void_p,c.c_bool,c.c_wchar_p],c.c_void_p),('ReleaseMutex',[c.c_void_p],c.c_bool),('OpenFileMappingW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('MapViewOfFile',[c.c_void_p,c.c_uint32,c.c_uint32,c.c_uint32,c.c_size_t],c.c_void_p),('OpenEventW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('SetEvent',[c.c_void_p],c.c_bool),('ResetEvent',[c.c_void_p],c.c_bool),('WaitForSingleObject',[c.c_void_p,c.c_uint32],c.c_uint32),('CloseHandle',[c.c_void_p],c.c_bool),('UnmapViewOfFile',[c.c_void_p],c.c_bool)]:
- f=getattr(k,name); f.argtypes=args; f.restype=ret
+for name,abi_args,ret in [('CreateMutexW',[c.c_void_p,c.c_bool,c.c_wchar_p],c.c_void_p),('ReleaseMutex',[c.c_void_p],c.c_bool),('OpenFileMappingW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('MapViewOfFile',[c.c_void_p,c.c_uint32,c.c_uint32,c.c_uint32,c.c_size_t],c.c_void_p),('OpenEventW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('SetEvent',[c.c_void_p],c.c_bool),('ResetEvent',[c.c_void_p],c.c_bool),('WaitForSingleObject',[c.c_void_p,c.c_uint32],c.c_uint32),('CloseHandle',[c.c_void_p],c.c_bool),('UnmapViewOfFile',[c.c_void_p],c.c_bool)]:
+ f=getattr(k,name); f.argtypes=abi_args; f.restype=ret
 h=k.OpenFileMappingW(6,False,'Local\\AMDANRMemoryMap'); assert h, c.get_last_error()
 p=k.MapViewOfFile(h,6,0,0,0x29e08); assert p
 s=k.OpenEventW(0x100002,False,'Local\\ANR_EVT_S'); d=k.OpenEventW(0x100002,False,'Local\\ANR_EVT_D'); assert s and d
@@ -20,28 +31,34 @@ try:
   c.memset(p+offset,0,256); c.memmove(p+offset,raw,len(raw))
   if enabled is not None: c.c_ubyte.from_address(p+offset+256).value=enabled
   c.c_int32.from_address(p+result).value=-999
+  c.c_uint64.from_address(p+offset-8).value=0
   c.c_uint32.from_address(p+0x818).value=command
   k.ResetEvent(d); assert k.SetEvent(s)
-  wait=k.WaitForSingleObject(d,5000)
-  print('command',hex(command),'wait',wait,'rc',c.c_int32.from_address(p+result).value,'state',c.c_ubyte.from_address(p+offset+256).value)
-  assert wait==0 and c.c_int32.from_address(p+result).value==0, 'IPC request failed'
+  deadline=time.monotonic()+5
+  while not (c.c_uint64.from_address(p+offset-8).value and c.c_int32.from_address(p+result).value != -999):
+   assert time.monotonic()<deadline, 'IPC response timed out'
+   k.WaitForSingleObject(d,50)
+  assert c.string_at(p+offset,len(raw))==raw, 'IPC response device mismatch'
+  print('command',hex(command),'rc',c.c_int32.from_address(p+result).value,'state',c.c_ubyte.from_address(p+offset+256).value)
+  assert c.c_int32.from_address(p+result).value==0, 'IPC request failed'
   return c.c_ubyte.from_address(p+offset+256).value
  state=request(0x86,0x868,0x96c)
- if '--recover' in sys.argv and not state:
+ if args.recover and not state:
   request(0x87,0x978,0xa7c,1)
   assert request(0x86,0x868,0x96c)==1
- if '--test-watchdog' in sys.argv:
+ if args.test_watchdog:
   assert state == 1, 'Expected enabled initial state'
+  assert capture_active(), 'Expected AMD to be actively capturing the pinned microphone before injection'
   started=time.monotonic()
   try:
    request(0x87,0x978,0xa7c,0)
    assert request(0x86,0x868,0x96c)==0, 'Fault injection did not disable microphone suppression'
    print('RED: AMD runtime suppression is OFF')
-   while time.monotonic()-started < 10:
+   while time.monotonic()-started < 20:
     time.sleep(0.5)
-    if request(0x86,0x868,0x96c)==1:
-     print('GREEN: watchdog recovered in %.2f seconds' % (time.monotonic()-started));break
-   else: raise AssertionError('Watchdog did not recover within 10 seconds')
+    if request(0x86,0x868,0x96c)==1 and capture_active():
+     print('GREEN: runtime flag AND AMD Windows capture session recovered in %.2f seconds' % (time.monotonic()-started));break
+   else: raise AssertionError('Watchdog did not restore live capture within 20 seconds')
   finally:
    request(0x87,0x978,0xa7c,1)
 finally:

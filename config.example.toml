@@ -15,7 +15,9 @@ autostart = false
 start_minimized = true
 close_to_tray = true
 restart_amd_if_missing = true
-apps = ["YY.exe", "KOOK.exe"]
+# Experimental Windows per-process input preference, not app-specific integration.
+# Populate with actual process filenames only when testing compatibility.
+apps = []
 pin_apps = false
 update_repository = "Lianzy-Baimiao/AudioPin"
 auto_check_updates = false

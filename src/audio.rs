@@ -37,6 +37,11 @@ pub struct Device {
 pub struct Audio {
     enumerator: IMMDeviceEnumerator,
 }
+#[derive(Debug, Serialize)]
+pub struct CaptureSession {
+    pub process_id: u32,
+    pub active: bool,
+}
 impl Audio {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -89,6 +94,24 @@ impl Audio {
             let id = p.to_string();
             CoTaskMemFree(Some(p.0.cast()));
             Ok(id?)
+        }
+    }
+    /// Inspect Windows' capture sessions without opening or recording the microphone.
+    pub fn capture_sessions(&self, id: &str) -> Result<Vec<CaptureSession>> {
+        unsafe {
+            let id = crate::platform::wide(id);
+            let device = self.enumerator.GetDevice(PCWSTR(id.as_ptr()))?;
+            let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+            let sessions = manager.GetSessionEnumerator()?;
+            let mut result = Vec::new();
+            for index in 0..sessions.GetCount()? {
+                let session: IAudioSessionControl2 = sessions.GetSession(index)?.cast()?;
+                result.push(CaptureSession {
+                    process_id: session.GetProcessId()?,
+                    active: session.GetState()? == AudioSessionStateActive,
+                });
+            }
+            Ok(result)
         }
     }
     pub fn set_default(&self, id: &str, role: i32) -> Result<()> {

@@ -60,7 +60,20 @@ fn entry() -> anyhow::Result<()> {
         } else {
             "未查询".into()
         };
-        let result = serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"amd_profile":supported.map(|_|"verified".into()).unwrap_or_else(|e|format!("{e:#}")),"amd_configured_input":id,"amd_runtime_enabled":state,"devices":devices,"default_input":a.default(1).ok(),"communications_input":a.default(2).ok(),"app_policy_supported":audio::AppPolicy::new().is_ok(),"autostart":platform::is_autostart()});
+        let sessions = a.capture_sessions(&id).map_err(|e| format!("{e:#}"));
+        let amd_pids: Vec<_> = platform::processes()?
+            .into_iter()
+            .filter_map(|(pid, name)| {
+                name.eq_ignore_ascii_case("AMDNoiseSuppression.exe")
+                    .then_some(pid)
+            })
+            .collect();
+        let capture_active = sessions.as_ref().ok().map(|sessions| {
+            sessions
+                .iter()
+                .any(|s| s.active && amd_pids.contains(&s.process_id))
+        });
+        let result = serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"amd_profile":supported.map(|_|"verified".into()).unwrap_or_else(|e|format!("{e:#}")),"amd_configured_input":id,"amd_runtime_enabled":state,"physical_capture_sessions":sessions,"amd_process_ids":amd_pids,"amd_capture_active":capture_active,"devices":devices,"default_input":a.default(1).ok(),"communications_input":a.default(2).ok(),"app_policy_supported":audio::AppPolicy::new().is_ok(),"autostart":platform::is_autostart()});
         let text = serde_json::to_string_pretty(&result)?;
         std::fs::create_dir_all(config::data_dir())?;
         std::fs::write(config::data_dir().join("diagnostics.json"), &text)?;

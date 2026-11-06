@@ -75,6 +75,41 @@ impl Backoff {
         self.next = None;
     }
 }
+#[derive(Default)]
+struct Recovery {
+    pending: bool,
+    sent_at: Option<Instant>,
+}
+#[derive(Debug, PartialEq)]
+enum RecoveryAction {
+    Ready,
+    Wait,
+    Repair,
+}
+impl Recovery {
+    fn action(
+        &self,
+        enabled: bool,
+        configured: bool,
+        capturing: bool,
+        now: Instant,
+    ) -> RecoveryAction {
+        if enabled && configured && capturing {
+            RecoveryAction::Ready
+        } else if self
+            .sent_at
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(6))
+        {
+            RecoveryAction::Wait
+        } else {
+            RecoveryAction::Repair
+        }
+    }
+    fn sent(&mut self) {
+        self.pending = true;
+        self.sent_at = Some(Instant::now());
+    }
+}
 fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> {
     let _com = Com::init()?;
     let audio = Audio::new()?;
@@ -87,7 +122,7 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
     let mut last_notification: Option<Instant> = None;
     let mut last_devices: Vec<(String, bool)> = vec![];
     let mut startup_attempt = None;
-    let mut pending_recovery = false;
+    let mut recovery = Recovery::default();
     let mut route_originals: HashMap<(u32, String, i32), (String, String)> = HashMap::new();
     let mut default_originals: HashMap<i32, (String, String)> = HashMap::new();
     let mut first = true;
@@ -96,14 +131,15 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
             match rx.recv_timeout(Duration::from_secs(config.poll_seconds)) {
                 Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(Command::Apply(c)) => {
-                    if c.physical_input != config.physical_input {
-                        pending_recovery = false;
+                    if c.physical_input != config.physical_input || !c.amd_enabled {
+                        recovery = Recovery::default();
                     }
                     config = c;
                     retry.reset();
                 }
                 Ok(Command::Pause(pause)) => {
                     config.guard_enabled = !pause;
+                    recovery = Recovery::default();
                     retry.reset();
                 }
                 Ok(Command::Check) => retry.reset(),
@@ -146,7 +182,7 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
         shared.lock().unwrap().devices = devices.clone();
         let process_list = platform::processes().unwrap_or_default();
         if !config.pin_apps {
-            shared.lock().unwrap().apps = "应用输入守护未启用".into();
+            shared.lock().unwrap().apps = "Windows 应用输入偏好守护未启用；实际输入未知".into();
         }
         // Restore only settings this process actually changed, and only if still ours.
         if !route_originals.is_empty() {
@@ -196,6 +232,7 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
             }
         }
         if !config.guard_enabled {
+            shared.lock().unwrap().apps = "守护已暂停；应用实际输入未知".into();
             publish(
                 &shared,
                 &config,
@@ -210,6 +247,9 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
         }
         if !retry.ready(now) {
             continue;
+        }
+        if config.pin_apps {
+            shared.lock().unwrap().apps = "本轮 Windows 偏好检查尚未完成；应用实际输入未知".into();
         }
         let outcome = (|| -> Result<(String, String)> {
             if config.amd_enabled {
@@ -236,34 +276,76 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
                     if startup_attempt
                         .is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(30))
                     {
+                        // The backend initializes asynchronously from this configuration.
+                        // Set it before launch and allow that initialization to finish
+                        // before attempting a device SET on the new process.
+                        amd::configure(&config.physical_input)?;
                         platform::hidden_command(amd::executable())
+                            // Radeon uses NoQuit: without it AMD exits while its global
+                            // registry toggle is off, which is precisely when we need it.
+                            .arg("NoQuit")
+                            .current_dir(amd::executable().parent().context("AMD 安装目录无效")?)
                             .spawn()
                             .context("启动 AMD 后台失败")?;
                         startup_attempt = Some(now);
+                        recovery.sent();
                         changes.push("AMD 后台缺失，已请求启动".into());
                     }
                     bail!("等待 AMD 后台启动");
                 }
                 let ipc = amd::Amd::connect()?;
-                let enabled = ipc.state(&config.physical_input)?;
+                let enabled = match ipc.state(&config.physical_input) {
+                    Ok(enabled) => enabled,
+                    Err(e)
+                        if amd::uninitialized(&e)
+                            && recovery.action(false, false, false, Instant::now())
+                                == RecoveryAction::Wait =>
+                    {
+                        return Ok((
+                            "正在恢复".into(),
+                            "AMD 后台正在初始化，等待就绪后复查麦克风采集。".into(),
+                        ));
+                    }
+                    Err(e) if amd::uninitialized(&e) => {
+                        recovery.pending = true;
+                        amd::configure(&config.physical_input)?;
+                        ipc.initialize()?;
+                        recovery.sent();
+                        changes.push("AMD 音频处理引擎未初始化，已完成初始化请求".into());
+                        ipc.state(&config.physical_input)?
+                    }
+                    Err(e) => return Err(e),
+                };
                 let configured = amd::configured_on()?
                     && amd::input_is_pinned()?
                     && amd::configured_input() == config.physical_input;
-                if !enabled || !configured {
-                    pending_recovery = true;
-                    changes.push(format!("检测到 AMD 降噪/输入偏离（运行开关：{enabled}）"));
-                    amd::configure(&config.physical_input)?;
-                    ipc.enable(&config.physical_input)?;
-                    if !amd::configured_on()? || !ipc.state(&config.physical_input)? {
-                        bail!("恢复后复查失败");
+                let capturing = audio
+                    .capture_sessions(&config.physical_input)?
+                    .iter()
+                    .any(|s| {
+                        s.active
+                            && process_list.iter().any(|(pid, name)| {
+                                *pid == s.process_id
+                                    && name.eq_ignore_ascii_case("AMDNoiseSuppression.exe")
+                            })
+                    });
+                match recovery.action(enabled, configured, capturing, Instant::now()) {
+                    RecoveryAction::Ready => {}
+                    RecoveryAction::Wait => {
+                        return Ok(("正在恢复".into(), "已发送恢复命令，等待 AMD 在指定麦克风上的采集会话启动；尚未确认恢复成功。".into()));
                     }
-                }
-                if pending_recovery {
-                    // A previous command may have succeeded while its reply collided with
-                    // Radeon Software. Only announce recovery after a fresh successful read.
-                    changes.push("AMD 麦克风降噪已自动恢复，并通过后台状态复查".into());
-                    shared.lock().unwrap().repaired += 1;
-                    pending_recovery = false;
+                    RecoveryAction::Repair => {
+                        let stalled = recovery.sent_at.is_some() && !capturing;
+                        changes.push(format!("检测到 AMD 降噪/输入偏离（运行开关：{enabled}，AMD 采集会话：{capturing}）"));
+                        recovery.sent();
+                        amd::configure(&config.physical_input)?;
+                        ipc.enable(&config.physical_input)?;
+                        if stalled {
+                            bail!("AMD 开关已开启，但指定麦克风的采集会话尚未恢复；已重发开启命令，将继续重试");
+                        }
+                        retry.reset();
+                        return Ok(("正在恢复".into(), "已发送恢复命令，等待 AMD 在指定麦克风上的采集会话启动；尚未确认恢复成功。".into()));
+                    }
                 }
             }
             let routing = config.pin_default || config.pin_communications || config.pin_apps;
@@ -313,24 +395,31 @@ fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> 
                                 policy.set_raw(*pid, role, &target)?;
                                 record.1 = target.clone();
                                 changes.push(format!(
-                                    "已固定 {name} 的输入路由（PID {pid}，角色 {role}）"
+                                    "已写入并读回 {name} 的 Windows 输入偏好（PID {pid}，角色 {role}）；应用实际输入未验证"
                                 ));
                             }
                         }
-                        active.push(format!("{name} · PID {pid} · 系统路由已固定"));
+                        active.push(format!(
+                            "{name} · PID {pid} · Windows 偏好值一致；实际输入未知"
+                        ));
                     }
                     shared.lock().unwrap().apps = if active.is_empty() {
-                        "等待配置中的语音软件启动".into()
+                        "未发现配置中的进程；应用实际输入未知".into()
                     } else {
                         active.join("\r\n")
                     };
                 }
             }
+            if config.amd_enabled && recovery.pending {
+                changes.push("AMD 麦克风降噪已自动恢复：后台开启，指定麦克风的 AMD 采集会话已活动，输入路由复查通过".into());
+                shared.lock().unwrap().repaired += 1;
+                recovery = Recovery::default();
+            }
             retry.reset();
             Ok((
                 "正在守护".into(),
                 if config.amd_enabled {
-                    "AMD 麦克风降噪运行开关已开启。设备断开、开关关闭或输入变更时自动恢复。\r\n此状态验证后台开关与设备连接，不评估音频内容或降噪效果。".into()
+                    "AMD 后台开关已开启，正在采集指定物理麦克风。\r\nAMD 设置面板可能仍显示“关闭”；此处独立检查 Windows 采集会话。未评估降噪效果或通话软件的实际输入。".into()
                 } else {
                     "AMD 守护已关闭。按配置固定 Windows / 应用输入路由。".into()
                 },
@@ -457,5 +546,36 @@ mod tests {
         assert!(b.ready(now + Duration::from_secs(60)));
         b.reset();
         assert!(b.ready(now));
+    }
+    #[test]
+    fn enabled_flag_without_capture_is_not_a_recovery() {
+        let now = Instant::now();
+        let mut recovery = Recovery::default();
+        assert_eq!(
+            recovery.action(true, true, false, now),
+            RecoveryAction::Repair
+        );
+        recovery.sent();
+        let now = Instant::now();
+        assert_eq!(
+            recovery.action(true, true, false, now),
+            RecoveryAction::Wait
+        );
+        assert_eq!(
+            recovery.action(true, true, true, now),
+            RecoveryAction::Ready
+        );
+        assert_eq!(
+            recovery.action(false, true, true, now),
+            RecoveryAction::Wait
+        );
+        assert_eq!(
+            recovery.action(true, false, true, now),
+            RecoveryAction::Wait
+        );
+        assert_eq!(
+            recovery.action(true, true, false, now + Duration::from_secs(7)),
+            RecoveryAction::Repair
+        );
     }
 }
