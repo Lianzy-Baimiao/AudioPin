@@ -4,3 +4,4 @@
 *.local.*
 /diagnostics/
 /diagnostics*.json
+__pycache__/
