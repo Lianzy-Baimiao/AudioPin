@@ -6,9 +6,9 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ptr::{null, null_mut},
-    sync::mpsc::Sender,
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -60,6 +60,20 @@ const RELOAD: i32 = 261;
 const OPEN_LOG: i32 = 262;
 const DIAG: i32 = 263;
 const EXIT: i32 = 299;
+const SOURCE_SUMMARY: i32 = 270;
+const TARGET_SUMMARY: i32 = 271;
+const AMD_SUMMARY: i32 = 272;
+const ROUTE_SUMMARY: i32 = 273;
+const FOOTER: i32 = 274;
+const BG: COLORREF = rgb(246, 248, 251);
+const SIDE: COLORREF = rgb(237, 241, 247);
+const INK: COLORREF = rgb(28, 39, 55);
+const MUTED: COLORREF = rgb(99, 113, 132);
+const ACCENT: COLORREF = rgb(36, 99, 218);
+const WHITE: COLORREF = rgb(255, 255, 255);
+const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
+    r | (g << 8) | (b << 16)
+}
 
 struct Control {
     hwnd: HWND,
@@ -76,7 +90,7 @@ struct App {
     fonts: Vec<HFONT>,
     config: Config,
     shared: Shared,
-    tx: Sender<Command>,
+    tx: guard::Control,
     page: i32,
     scale: f32,
     physical_ids: Vec<String>,
@@ -86,6 +100,7 @@ struct App {
     taskbar_message: u32,
     update_busy: bool,
     last_events: String,
+    dirty: bool,
 }
 pub fn run(config: Config, background: bool) -> Result<()> {
     unsafe {
@@ -125,7 +140,7 @@ pub fn run(config: Config, background: bool) -> Result<()> {
             bail!("无法注册窗口类：{}", std::io::Error::last_os_error());
         }
         let (tx, shared, worker) = guard::start(config.clone());
-        let mut app = Box::new(App {
+        let app = Box::new(RefCell::new(App {
             hwnd: null_mut(),
             controls: HashMap::new(),
             fonts: vec![],
@@ -141,7 +156,8 @@ pub fn run(config: Config, background: bool) -> Result<()> {
             taskbar_message: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             update_busy: false,
             last_events: String::new(),
-        });
+            dirty: false,
+        }));
         let scale = GetDpiForSystem() as f32 / 96.0;
         let hwnd = CreateWindowExW(
             0,
@@ -150,33 +166,34 @@ pub fn run(config: Config, background: bool) -> Result<()> {
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            (960.0 * scale) as i32,
-            (720.0 * scale) as i32,
+            (984.0 * scale) as i32,
+            (758.0 * scale) as i32,
             null_mut(),
             null_mut(),
             module,
-            (&mut *app as *mut App).cast(),
+            (app.as_ref() as *const RefCell<App>).cast(),
         );
+        let mut state = app.borrow_mut();
         if hwnd.is_null() {
-            let _ = app.tx.send(Command::Stop);
+            let _ = state.tx.send(Command::Stop);
             let _ = worker.join();
             bail!("创建窗口失败");
         }
-        app.hwnd = hwnd;
-        app.scale = GetDpiForWindow(hwnd) as f32 / 96.0;
-        app.build();
-        app.tray_ok = app.tray(NIM_ADD, None);
-        app.load_fields();
-        app.page(0);
-        app.layout();
+        state.hwnd = hwnd;
+        state.scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+        state.build();
+        state.tray_ok = state.tray(NIM_ADD, None);
+        state.load_fields();
+        state.page(0);
+        state.layout();
         SetTimer(hwnd, 1, 500, None);
-        if !background || !app.config.start_minimized || !app.tray_ok {
-            ShowWindow(hwnd, SW_SHOW);
+        if !background || !state.config.start_minimized || !state.tray_ok {
             ShowWindow(hwnd, SW_SHOW);
         }
-        if app.config.auto_check_updates {
-            app.check_update();
+        if state.config.auto_check_updates {
+            state.check_update();
         }
+        drop(state);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             if IsDialogMessageW(hwnd, &msg) == 0 {
@@ -184,10 +201,11 @@ pub fn run(config: Config, background: bool) -> Result<()> {
                 DispatchMessageW(&msg);
             }
         }
-        app.tray(NIM_DELETE, None);
-        let _ = app.tx.send(Command::Stop);
+        let state = app.borrow();
+        state.tray(NIM_DELETE, None);
+        let _ = state.tx.send(Command::Stop);
         let _ = worker.join();
-        for f in &app.fonts {
+        for f in &state.fonts {
             DeleteObject(*f);
         }
         drop(instance);
@@ -208,7 +226,7 @@ impl App {
     ) {
         let (x, y, w, h) = rect;
         let hwnd = CreateWindowExW(
-            if class == "EDIT" || class == "COMBOBOX" {
+            if class == "EDIT" && style & ES_READONLY as u32 == 0 {
                 WS_EX_CLIENTEDGE
             } else {
                 0
@@ -240,7 +258,14 @@ impl App {
         );
     }
     unsafe fn label(&mut self, id: i32, page: i32, text: &str, rect: (i32, i32, i32, i32)) {
-        self.add(id, page, "STATIC", text, 0, rect, true);
+        // SS_ENDELLIPSIS from WinUser.h; generated windows-sys places static
+        // control styles outside this feature set.
+        let style = if [SOURCE_SUMMARY, TARGET_SUMMARY].contains(&id) {
+            0x00004000
+        } else {
+            0
+        };
+        self.add(id, page, "STATIC", text, style, rect, true);
     }
     unsafe fn button(&mut self, id: i32, page: i32, text: &str, rect: (i32, i32, i32, i32)) {
         self.add(
@@ -248,7 +273,7 @@ impl App {
             page,
             "BUTTON",
             text,
-            WS_TABSTOP | BS_PUSHBUTTON as u32,
+            WS_TABSTOP | BS_OWNERDRAW as u32,
             rect,
             false,
         );
@@ -260,7 +285,7 @@ impl App {
             "BUTTON",
             text,
             WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-            (210, y, 660, 28),
+            (264, y, 632, 28),
             true,
         );
     }
@@ -290,68 +315,87 @@ impl App {
     }
     unsafe fn build(&mut self) {
         self.make_fonts();
-        self.label(1, -1, "AudioPin", (26, 26, 150, 40));
-        SendMessageW(self.h(1), WM_SETFONT, self.fonts[1] as usize, 1);
-        self.label(2, -1, "让声音一直在线", (27, 70, 150, 28));
+        self.label(1, -1, "AudioPin", (24, 32, 160, 36));
+        self.label(2, -1, "麦克风与降噪守护", (26, 78, 164, 22));
         for (i, text) in [
             "守护概览",
             "设备与路由",
-            "Windows 应用偏好",
+            "应用输入偏好",
             "偏好设置",
             "关于与更新",
         ]
         .iter()
         .enumerate()
         {
-            self.button(100 + i as i32, -1, text, (20, 124 + i as i32 * 49, 158, 38));
+            self.button(100 + i as i32, -1, text, (16, 132 + i as i32 * 48, 176, 40));
         }
         self.label(
             3,
             -1,
-            concat!("v", env!("CARGO_PKG_VERSION"), "\r\nRust · Windows 原生"),
-            (26, 548, 155, 52),
+            concat!("v", env!("CARGO_PKG_VERSION"), "  /  Windows 原生"),
+            (24, 634, 176, 24),
         );
-        self.button(SAVE, -1, "保存并应用", (742, 612, 150, 36));
-        self.button(PAUSE, 0, "暂停守护", (210, 176, 130, 34));
-        self.button(CHECK, 0, "立即检查", (352, 176, 130, 34));
-        self.label(STATUS, 0, "正在检查", (210, 31, 680, 42));
-        SendMessageW(self.h(STATUS), WM_SETFONT, self.fonts[1] as usize, 1);
+        self.label(FOOTER, -1, "设置已保存", (240, 669, 470, 24));
+        self.button(SAVE, -1, "保存并应用", (784, 658, 152, 38));
+
+        self.label(30, 0, "守护概览", (240, 30, 680, 38));
         self.label(
-            DETAIL,
+            31,
             0,
-            "连接 AMD 后台与 Windows 音频服务…",
-            (210, 84, 670, 76),
+            "自动检查、恢复，持续关注你的输入设备。",
+            (240, 73, 680, 24),
         );
-        self.label(COUNTS, 0, "", (210, 230, 670, 30));
-        self.label(10, 0, "最近事件", (210, 282, 660, 30));
+        self.label(STATUS, 0, "正在检查", (268, 124, 340, 35));
+        self.label(DETAIL, 0, "正在连接音频设备…", (268, 172, 636, 48));
+        self.button(PAUSE, 0, "暂停守护", (638, 122, 124, 34));
+        self.button(CHECK, 0, "立即检查", (778, 122, 124, 34));
+        self.label(COUNTS, 0, "", (268, 226, 636, 22));
+        self.label(32, 0, "AMD 麦克风", (268, 283, 138, 24));
+        self.label(SOURCE_SUMMARY, 0, "", (420, 281, 484, 26));
+        self.label(AMD_SUMMARY, 0, "", (420, 311, 484, 38));
+        self.label(33, 0, "Windows 输入", (268, 367, 138, 24));
+        self.label(TARGET_SUMMARY, 0, "", (420, 365, 484, 26));
+        self.label(ROUTE_SUMMARY, 0, "", (420, 395, 484, 38));
+        self.label(10, 0, "最近活动", (240, 466, 350, 24));
         self.edit(
             EVENTS,
             0,
             "",
-            (210, 317, 680, 215),
-            ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL | ES_AUTOVSCROLL as u32,
+            (264, 506, 640, 102),
+            ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL,
         );
-        self.button(OPEN_LOG, 0, "打开日志目录", (210, 548, 140, 34));
-        self.button(DIAG, 0, "导出本机诊断", (365, 548, 150, 34));
+        self.button(OPEN_LOG, 0, "完整日志", (666, 458, 110, 32));
+        self.button(DIAG, 0, "导出诊断", (792, 458, 128, 32));
 
-        self.label(11, 1, "设备与路由", (210, 31, 680, 40));
-        self.label(12,1,"原始麦克风 → AMD 降噪 → 语音软件\r\n按设备 ID 固定；原设备离线时等待重连，不自动改用远程虚拟麦克风。",(210,82,680,60));
-        self.checkbox(AMD, 1, "守护 AMD 麦克风降噪", 151);
-        self.label(13, 1, "AMD 使用的原始麦克风", (210, 199, 680, 27));
+        self.label(11, 1, "设备与路由", (240, 30, 680, 38));
+        self.label(
+            12,
+            1,
+            "原始麦克风 → AMD 降噪 → Windows / 语音软件",
+            (240, 73, 680, 24),
+        );
+        self.checkbox(AMD, 1, "守护 AMD 麦克风降噪", 128);
+        self.label(13, 1, "AMD 使用的原始麦克风", (264, 180, 640, 26));
         self.add(
             PHYSICAL,
             1,
             "COMBOBOX",
             "",
             WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-            (210, 230, 680, 210),
+            (264, 218, 640, 200),
             true,
+        );
+        self.label(
+            34,
+            1,
+            "按设备标识固定。断开后等待原设备重连。",
+            (264, 263, 640, 24),
         );
         self.label(
             14,
             1,
-            "提供给 Windows / 语音软件的输入（建议选 AMD Streaming）",
-            (210, 294, 680, 27),
+            "提供给 Windows / 语音软件的输入",
+            (264, 334, 640, 26),
         );
         self.add(
             OUTPUT,
@@ -359,99 +403,142 @@ impl App {
             "COMBOBOX",
             "",
             WS_TABSTOP | CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
-            (210, 326, 680, 210),
+            (264, 374, 640, 200),
             true,
         );
-        self.checkbox(
-            PIN_DEFAULT,
+        self.checkbox(PIN_DEFAULT, 1, "固定 Windows 默认输入", 432);
+        self.checkbox(PIN_COMMS, 1, "固定 Windows 通信输入", 474);
+        self.label(
+            15,
             1,
-            "固定 Windows 默认输入（控制台 / 多媒体）",
-            391,
+            "建议选择 AMD Streaming 作为输出。\r\n语音软件仍需选择系统默认或相应设备。",
+            (264, 551, 640, 52),
         );
-        self.checkbox(PIN_COMMS, 1, "固定 Windows 默认通信输入", 431);
-        self.label(15,1,"提示：先确认 AMD 选中正确的原始麦克风。不要将降噪输出当作原始输入。\r\n暂停守护时，会尽可能还原本次运行修改过的系统与应用路由。",(210,493,680,70));
 
-        self.label(16, 2, "Windows 应用输入偏好", (210, 31, 680, 40));
-        self.label(17,2,"仅守护 Windows 为应用保存的首选输入设备。\r\nYY / KOOK 内部麦克风配置守护尚未实现；这两款软件的兼容效果未验证。",(210,82,680,65));
-        self.checkbox(PIN_APPS, 2, "守护 Windows 输入偏好（实验性）", 158);
+        self.label(16, 2, "应用输入偏好", (240, 30, 680, 38));
+        self.label(
+            17,
+            2,
+            "实验性 · 仅设置 Windows 为应用保存的首选输入",
+            (240, 73, 680, 24),
+        );
+        self.checkbox(PIN_APPS, 2, "守护 Windows 应用输入偏好", 128);
         self.label(
             18,
             2,
-            "进程文件名（每行一个；可在任务管理器“详细信息”中查看）",
-            (210, 208, 680, 28),
+            "进程文件名，每行一个（例如 YY.exe）",
+            (264, 184, 640, 26),
         );
         self.edit(
             APP_NAMES,
             2,
             "",
-            (210, 241, 680, 130),
+            (264, 222, 640, 120),
             ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | WS_VSCROLL | ES_WANTRETURN as u32,
         );
-        self.label(
-            19,
-            2,
-            "Windows 偏好读回结果（应用实际输入未知）",
-            (210, 399, 680, 28),
-        );
+        self.label(19, 2, "Windows 偏好检查结果", (264, 383, 640, 26));
         self.edit(
             APP_STATUS,
             2,
             "等待检测",
-            (210, 434, 680, 106),
+            (264, 421, 640, 88),
             ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL,
         );
+        self.label(20, 2, "YY / KOOK 内部麦克风配置尚未接入。\r\n偏好一致不能证明应用实际使用了该输入。应用退出后偏好可能保留。", (264, 551, 640, 62));
+
+        self.label(21, 3, "偏好设置", (240, 30, 680, 38));
+        self.label(35, 3, "按你的使用习惯，调整后台守护。", (240, 73, 680, 24));
+        self.checkbox(AUTOSTART, 3, "登录 Windows 时自动启动", 128);
+        self.checkbox(MINIMIZED, 3, "自动启动时隐藏到托盘", 168);
+        self.checkbox(CLOSE_TRAY, 3, "关闭窗口时保留托盘守护", 208);
+        self.checkbox(RESTART_AMD, 3, "AMD 后台退出后自动尝试启动", 248);
+        self.checkbox(NOTIFY, 3, "状态变化时显示 Windows 通知", 288);
+        self.label(22, 3, "检查间隔 / 秒（1–60）", (264, 367, 390, 26));
+        self.edit(POLL, 3, "2", (776, 362, 128, 30), ES_NUMBER as u32);
+        self.label(23, 3, "修复重试上限 / 秒（5–600）", (264, 413, 390, 26));
+        self.edit(RETRY, 3, "60", (776, 408, 128, 30), ES_NUMBER as u32);
+        self.label(24, 3, "重复修复通知间隔 / 秒", (264, 459, 390, 26));
+        self.edit(COOLDOWN, 3, "10", (776, 454, 128, 30), ES_NUMBER as u32);
         self.label(
-            20,
-            2,
-            "应用可能忽略此偏好。偏好值一致不能证明通话已使用目标麦克风。",
-            (210, 557, 680, 40),
+            25,
+            3,
+            "配置保存在本机。手动修改 TOML 后可重新载入。",
+            (264, 552, 640, 24),
         );
+        self.button(OPEN_CONFIG, 3, "打开配置目录", (264, 590, 148, 34));
+        self.button(RELOAD, 3, "重新载入", (428, 590, 128, 34));
 
-        self.label(21, 3, "偏好设置", (210, 31, 680, 40));
-        self.checkbox(AUTOSTART, 3, "登录 Windows 时自动启动", 88);
-        self.checkbox(MINIMIZED, 3, "自动启动时隐藏到托盘", 126);
-        self.checkbox(CLOSE_TRAY, 3, "关闭窗口时保留托盘守护", 164);
-        self.checkbox(RESTART_AMD, 3, "AMD 后台意外退出时尝试重新启动", 202);
-        self.checkbox(NOTIFY, 3, "状态变化时显示 Windows 托盘通知", 240);
-        self.label(22, 3, "检查间隔 / 秒（1–60）", (210, 301, 260, 28));
-        self.edit(POLL, 3, "2", (505, 296, 95, 30), ES_NUMBER as u32);
-        self.label(23, 3, "失败重试上限 / 秒（5–600）", (210, 344, 270, 28));
-        self.edit(RETRY, 3, "60", (505, 339, 95, 30), ES_NUMBER as u32);
-        self.label(24, 3, "重复修复通知间隔 / 秒", (210, 387, 270, 28));
-        self.edit(COOLDOWN, 3, "10", (505, 382, 95, 30), ES_NUMBER as u32);
-        self.label(25,3,"配置存放在 %LOCALAPPDATA%\\AudioPin。\r\n编辑 TOML 后点击重新载入；语法错误会保留当前正在使用的配置。",(210,445,680,64));
-        self.button(OPEN_CONFIG, 3, "打开配置目录", (210, 525, 150, 34));
-        self.button(RELOAD, 3, "重新载入配置", (375, 525, 150, 34));
-
-        self.label(26, 4, "关于 AudioPin", (210, 31, 680, 40));
-        self.label(27,4,concat!("版本 ",env!("CARGO_PKG_VERSION")," · Windows x64\r\n作者：Lianzy-Baimiao  |  MIT License\r\nRust + Win32 原生控件，无 WebView；不录音、不上传音频、不采集遥测。"),(210,82,680,91));
-        self.label(28, 4, "GitHub 更新仓库", (210, 194, 680, 28));
-        self.edit(REPO, 4, "", (210, 229, 680, 32), 0);
-        self.checkbox(AUTH, 4, "使用本机 GitHub CLI 登录访问私有仓库", 284);
-        self.checkbox(AUTO_UPDATE, 4, "每次启动自动检查更新（需要网络）", 324);
-        self.button(UPDATE, 4, "检查 GitHub 更新", (210, 377, 175, 35));
-        self.button(RELEASES, 4, "打开发布页", (398, 377, 135, 35));
-        self.button(PROJECT, 4, "项目仓库", (546, 377, 135, 35));
+        self.label(26, 4, "关于 AudioPin", (240, 30, 680, 38));
+        self.label(
+            36,
+            4,
+            "让麦克风的状态可见，让意外中断可恢复。",
+            (240, 73, 680, 24),
+        );
+        self.label(27, 4, concat!("AudioPin ", env!("CARGO_PKG_VERSION"), " · Rust + Win32\r\nLianzy-Baimiao  /  MIT License\r\n无 WebView · 不录音 · 不上传音频"), (264, 128, 640, 80));
+        self.label(28, 4, "GitHub 更新仓库", (264, 254, 640, 26));
+        self.edit(REPO, 4, "", (264, 290, 640, 32), 0);
+        self.checkbox(AUTH, 4, "使用本机 GitHub CLI 登录访问私有仓库", 340);
+        self.checkbox(AUTO_UPDATE, 4, "启动时自动检查更新", 380);
+        self.button(UPDATE, 4, "检查更新", (264, 432, 136, 34));
+        self.button(RELEASES, 4, "打开发布页", (416, 432, 136, 34));
+        self.button(PROJECT, 4, "项目仓库", (568, 432, 128, 34));
         self.edit(
             UPDATE_STATUS,
             4,
             "尚未检查更新",
-            (210, 431, 680, 92),
-            ES_MULTILINE as u32 | ES_READONLY as u32 | WS_VSCROLL,
+            (264, 490, 640, 54),
+            ES_MULTILINE as u32 | ES_READONLY as u32,
         );
-        self.label(29,4,"私有仓库需先执行 gh auth login。令牌由 GitHub CLI 保管，不写入配置。\r\n更新检查只读取 Release；下载与安装由你从发布页操作。\r\nAMD 控制适配经过版本校验；驱动变更后可能需要更新 AudioPin。",(210,540,680,66));
-        for id in [11, 16, 21, 26] {
-            SendMessageW(self.h(id), WM_SETFONT, self.fonts[1] as usize, 1);
+        self.label(
+            29,
+            4,
+            "AMD 面板状态同步尚未解决；降噪效果尚未验证。\r\n驱动版本变更后可能需要更新适配。",
+            (264, 575, 640, 48),
+        );
+        self.apply_fonts();
+    }
+    unsafe fn apply_fonts(&self) {
+        for (id, c) in &self.controls {
+            let index = if [1, STATUS, 11, 16, 21, 26, 30].contains(id) {
+                1
+            } else if [
+                2,
+                3,
+                10,
+                12,
+                15,
+                17,
+                20,
+                25,
+                29,
+                31,
+                34,
+                35,
+                36,
+                COUNTS,
+                EVENTS,
+                AMD_SUMMARY,
+                ROUTE_SUMMARY,
+                FOOTER,
+            ]
+            .contains(id)
+            {
+                2
+            } else {
+                0
+            };
+            SendMessageW(c.hwnd, WM_SETFONT, self.fonts[index] as usize, 0);
         }
     }
     unsafe fn make_fonts(&mut self) {
-        for size in [16, 27] {
+        for size in [15, 26, 14] {
             self.fonts.push(CreateFontW(
                 -(size as f32 * self.scale) as i32,
                 0,
                 0,
                 0,
-                if size == 27 { 600 } else { 400 },
+                if size == 26 { 600 } else { 400 },
                 0,
                 0,
                 0,
@@ -492,6 +579,11 @@ impl App {
     }
     unsafe fn page(&mut self, page: i32) {
         self.page = page;
+        SetPropW(
+            self.hwnd,
+            wide("AudioPin.Page").as_ptr(),
+            (page + 1) as HANDLE,
+        );
         for c in self.controls.values() {
             ShowWindow(
                 c.hwnd,
@@ -503,15 +595,33 @@ impl App {
             );
         }
         for i in 0..5 {
-            SendMessageW(self.h(100 + i), BM_SETSTATE, usize::from(i == page), 0);
+            SetPropW(
+                self.h(100 + i),
+                wide("AudioPin.Selected").as_ptr(),
+                usize::from(i == page) as HANDLE,
+            );
+            InvalidateRect(self.h(100 + i), null(), 1);
         }
+        ShowWindow(self.h(SAVE), if page == 0 { SW_HIDE } else { SW_SHOW });
+        InvalidateRect(self.hwnd, null(), 1);
     }
     unsafe fn layout(&mut self) {
         let mut r: RECT = std::mem::zeroed();
         GetClientRect(self.hwnd, &mut r);
-        let extra = ((r.right as f32 / self.scale) as i32 - 924).max(0);
+        let extra = ((r.right as f32 / self.scale) as i32 - 968).max(0);
+        let vertical = ((r.bottom as f32 / self.scale) as i32 - 719).max(0);
         for (id, c) in &self.controls {
-            let x = if *id == SAVE { c.x + extra } else { c.x };
+            let x = if [SAVE, PAUSE, CHECK, POLL, RETRY, COOLDOWN, DIAG, OPEN_LOG].contains(id) {
+                c.x + extra
+            } else {
+                c.x
+            };
+            let y = c.y
+                + if [SAVE, FOOTER, 3].contains(id) {
+                    vertical
+                } else {
+                    0
+                };
             let width = if c.stretch && c.w > 300 {
                 c.w + extra
             } else {
@@ -520,12 +630,13 @@ impl App {
             MoveWindow(
                 c.hwnd,
                 (x as f32 * self.scale) as i32,
-                (c.y as f32 * self.scale) as i32,
+                (y as f32 * self.scale) as i32,
                 (width as f32 * self.scale) as i32,
                 (c.h as f32 * self.scale) as i32,
                 1,
             );
         }
+        InvalidateRect(self.hwnd, null(), 1);
     }
     unsafe fn load_fields(&mut self) {
         let c = &self.config;
@@ -562,6 +673,8 @@ impl App {
             },
         );
         self.device_key.clear();
+        self.dirty = false;
+        self.set(FOOTER, "设置已保存");
     }
     unsafe fn gather(&self) -> Result<Config> {
         let mut c = self.config.clone();
@@ -624,20 +737,46 @@ impl App {
         self.config = c;
         guard::log(&mut self.shared.lock().unwrap(), "配置已保存并应用");
         self.set(SAVE, "已保存");
+        self.dirty = false;
+        self.set(FOOTER, "设置已保存");
         Ok(())
     }
     unsafe fn refresh(&mut self) {
         let (snapshot, notification) = {
             let mut s = self.shared.lock().unwrap();
-            let n = s.pending_notification.take();
+            let n = if self.config.notifications {
+                s.notifications.pop_front()
+            } else {
+                s.notifications.clear();
+                None
+            };
             (s.clone(), n)
         };
         let title_changed = self.text(STATUS) != snapshot.title;
         self.set(STATUS, &snapshot.title);
         if title_changed {
             self.tray(NIM_MODIFY, None);
+            InvalidateRect(self.hwnd, null(), 0);
         }
         self.set(DETAIL, &snapshot.detail);
+        self.set(AMD_SUMMARY, &snapshot.amd_detail);
+        self.set(ROUTE_SUMMARY, &snapshot.route_detail);
+        let name = |id: &str| {
+            snapshot
+                .devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| format!("{}{}", if d.active { "" } else { "离线 · " }, d.name))
+                .unwrap_or_else(|| {
+                    if id.is_empty() {
+                        "尚未选择设备".into()
+                    } else {
+                        "已选设备未连接".into()
+                    }
+                })
+        };
+        self.set(SOURCE_SUMMARY, &name(&self.config.physical_input));
+        self.set(TARGET_SUMMARY, &name(&self.config.output_input));
         self.set(
             COUNTS,
             &format!(
@@ -671,7 +810,7 @@ impl App {
             .map(|d| format!("{}:{}", d.id, d.active))
             .collect::<Vec<_>>()
             .join(";");
-        if key != self.device_key && !snapshot.devices.is_empty() {
+        if key != self.device_key || self.physical_ids.is_empty() {
             let selected_physical = self
                 .selection(PHYSICAL, &self.physical_ids)
                 .unwrap_or_else(|| self.config.physical_input.clone());
@@ -835,7 +974,9 @@ impl App {
                     DestroyWindow(self.hwnd);
                 }
                 _ => {
+                    self.dirty = true;
                     self.set(SAVE, "保存并应用");
+                    self.set(FOOTER, "有未保存的更改");
                 }
             }
             Ok(())
@@ -850,19 +991,291 @@ fn copy_text<const N: usize>(dst: &mut [u16; N], text: &str) {
         *a = b;
     }
 }
+unsafe fn fill(dc: HDC, rect: &RECT, color: COLORREF) {
+    SetDCBrushColor(dc, color);
+    FillRect(dc, rect, GetStockObject(DC_BRUSH) as HBRUSH);
+}
+unsafe fn rounded(dc: HDC, rect: &RECT, color: COLORREF, border: COLORREF, radius: i32) {
+    let brush = CreateSolidBrush(color);
+    let pen = CreatePen(PS_SOLID, 1, border);
+    let old_brush = SelectObject(dc, brush);
+    let old_pen = SelectObject(dc, pen);
+    RoundRect(
+        dc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+unsafe fn window_text(hwnd: HWND) -> String {
+    let count = GetWindowTextLengthW(hwnd);
+    let mut text = vec![0u16; count as usize + 1];
+    let read = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
+    String::from_utf16_lossy(&text[..read as usize])
+}
+/// Paint-only messages must be handled even while App is mutably borrowed by
+/// the outer Windows callback. They never access a Rust App reference.
+unsafe fn window_message(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let px = |n: i32| (n as f32 * scale) as i32;
+    match msg {
+        WM_GETMINMAXINFO => {
+            let m = &mut *(l as *mut MINMAXINFO);
+            m.ptMinTrackSize.x = px(984);
+            m.ptMinTrackSize.y = px(758);
+            Some(0)
+        }
+        WM_DESTROY => {
+            KillTimer(hwnd, 1);
+            PostQuitMessage(0);
+            Some(0)
+        }
+        WM_NCDESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            RemovePropW(hwnd, wide("AudioPin.Page").as_ptr());
+            Some(DefWindowProcW(hwnd, msg, w, l))
+        }
+        WM_ERASEBKGND => Some(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut r = RECT::default();
+            GetClientRect(hwnd, &mut r);
+            fill(dc, &r, BG);
+            fill(
+                dc,
+                &RECT {
+                    right: px(208),
+                    ..r
+                },
+                SIDE,
+            );
+            let page = GetPropW(hwnd, wide("AudioPin.Page").as_ptr()) as usize;
+            let cards: &[(i32, i32)] = match page {
+                1 => &[(112, 256), (268, 352), (360, 444), (496, 630)],
+                2 => &[(112, 306), (318, 526)],
+                3 => &[(112, 530)],
+                4 => &[(112, 332), (350, 516)],
+                5 => &[(112, 222), (240, 554)],
+                _ => &[],
+            };
+            for (top, bottom) in cards {
+                rounded(
+                    dc,
+                    &RECT {
+                        left: px(240),
+                        top: px(*top),
+                        right: r.right - px(32),
+                        bottom: px(*bottom),
+                    },
+                    WHITE,
+                    rgb(224, 231, 240),
+                    px(12),
+                );
+            }
+            if page == 1 {
+                let title = window_text(GetDlgItem(hwnd, STATUS));
+                let color = match title.as_str() {
+                    "守护运行中" => rgb(23, 133, 94),
+                    "需要关注" | "守护已停止" | "音频服务不可用" => {
+                        rgb(186, 76, 37)
+                    }
+                    _ => ACCENT,
+                };
+                fill(
+                    dc,
+                    &RECT {
+                        left: px(240),
+                        right: px(244),
+                        top: px(130),
+                        bottom: px(154),
+                    },
+                    color,
+                );
+            }
+            fill(
+                dc,
+                &RECT {
+                    left: px(240),
+                    right: r.right - px(32),
+                    top: r.bottom - px(72),
+                    bottom: r.bottom - px(71),
+                },
+                rgb(224, 231, 240),
+            );
+            EndPaint(hwnd, &ps);
+            Some(0)
+        }
+        WM_DRAWITEM => {
+            let draw = &*(l as *const DRAWITEMSTRUCT);
+            if draw.CtlType != ODT_BUTTON {
+                return None;
+            }
+            let id = draw.CtlID as i32;
+            let nav = (100..105).contains(&id);
+            let selected = !GetPropW(draw.hwndItem, wide("AudioPin.Selected").as_ptr()).is_null();
+            let pressed = draw.itemState & ODS_SELECTED != 0;
+            let disabled = draw.itemState & ODS_DISABLED != 0;
+            let primary = id == SAVE;
+            let color = if primary {
+                if pressed {
+                    rgb(26, 78, 178)
+                } else {
+                    ACCENT
+                }
+            } else if nav {
+                if selected {
+                    rgb(217, 230, 252)
+                } else {
+                    SIDE
+                }
+            } else if pressed {
+                rgb(231, 238, 249)
+            } else {
+                WHITE
+            };
+            fill(
+                draw.hDC,
+                &draw.rcItem,
+                if nav {
+                    SIDE
+                } else if primary || [DIAG, OPEN_LOG, OPEN_CONFIG, RELOAD].contains(&id) {
+                    BG
+                } else {
+                    WHITE
+                },
+            );
+            rounded(
+                draw.hDC,
+                &draw.rcItem,
+                color,
+                if nav || primary {
+                    color
+                } else {
+                    rgb(207, 217, 231)
+                },
+                px(8),
+            );
+            if nav && selected {
+                fill(
+                    draw.hDC,
+                    &RECT {
+                        left: draw.rcItem.left + px(1),
+                        right: draw.rcItem.left + px(4),
+                        top: draw.rcItem.top + px(11),
+                        bottom: draw.rcItem.bottom - px(11),
+                    },
+                    ACCENT,
+                );
+            }
+            SetBkMode(draw.hDC, TRANSPARENT as i32);
+            SetTextColor(
+                draw.hDC,
+                if disabled {
+                    MUTED
+                } else if primary {
+                    WHITE
+                } else if selected {
+                    ACCENT
+                } else {
+                    INK
+                },
+            );
+            let font = SendMessageW(draw.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+            let old = SelectObject(draw.hDC, font);
+            let mut rect = draw.rcItem;
+            if nav {
+                rect.left += px(24);
+            }
+            let text = wide(window_text(draw.hwndItem));
+            DrawTextW(
+                draw.hDC,
+                text.as_ptr(),
+                -1,
+                &mut rect,
+                DT_SINGLELINE | DT_VCENTER | if nav { DT_LEFT } else { DT_CENTER },
+            );
+            SelectObject(draw.hDC, old);
+            if draw.itemState & ODS_FOCUS != 0 && draw.itemState & ODS_NOFOCUSRECT == 0 {
+                InflateRect(&mut rect, -px(4), -px(4));
+                DrawFocusRect(draw.hDC, &rect);
+            }
+            Some(1)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
+            let dc = w as HDC;
+            let id = GetDlgCtrlID(l as HWND);
+            let background = if [1, 2, 3].contains(&id) {
+                SIDE
+            } else if [
+                10, 11, 12, 15, 16, 17, 20, 21, 25, 26, 29, 30, 31, 35, 36, FOOTER,
+            ]
+            .contains(&id)
+            {
+                BG
+            } else {
+                WHITE
+            };
+            let muted = [
+                2,
+                3,
+                12,
+                15,
+                17,
+                20,
+                25,
+                29,
+                31,
+                34,
+                35,
+                36,
+                COUNTS,
+                AMD_SUMMARY,
+                ROUTE_SUMMARY,
+                FOOTER,
+            ]
+            .contains(&id);
+            SetBkColor(dc, background);
+            SetTextColor(dc, if muted { MUTED } else { INK });
+            SetDCBrushColor(dc, background);
+            Some(GetStockObject(DC_BRUSH) as isize)
+        }
+        _ => None,
+    }
+}
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let create = &*(l as *const CREATESTRUCTW);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
     }
-    let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    // Synchronous paint/child notifications can reenter during layout, text
+    // updates and modal menus. Painting uses only HWND state; never borrow App.
+    if let Some(result) = window_message(hwnd, msg, w, l) {
+        return result;
+    }
+    let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
     if pointer.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
     }
-    let app = &mut *pointer;
+    let cell = &*pointer;
+    let Ok(mut app) = cell.try_borrow_mut() else {
+        // Programmatic control updates send nested notifications. Their state
+        // is already being applied by the outer call and must not be replayed.
+        return DefWindowProcW(hwnd, msg, w, l);
+    };
     match msg {
         WM_COMMAND => {
-            app.act((w & 0xffff) as i32);
+            let code = (w >> 16) as u32;
+            if [BN_CLICKED, EN_CHANGE, CBN_SELCHANGE].contains(&code) {
+                app.act((w & 0xffff) as i32);
+            }
             0
         }
         WM_TIMER => {
@@ -875,13 +1288,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             } else {
                 app.layout();
             }
-            0
-        }
-        WM_GETMINMAXINFO => {
-            let m = &mut *(l as *mut MINMAXINFO);
-            let scale = if app.scale > 0.0 { app.scale } else { 1.0 };
-            m.ptMinTrackSize.x = (940.0 * scale) as i32;
-            m.ptMinTrackSize.y = (710.0 * scale) as i32;
             0
         }
         WM_DPICHANGED => {
@@ -898,14 +1304,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             );
             let old = std::mem::take(&mut app.fonts);
             app.make_fonts();
-            for (id, c) in &app.controls {
-                SendMessageW(
-                    c.hwnd,
-                    WM_SETFONT,
-                    app.fonts[usize::from([1, STATUS, 11, 16, 21, 26].contains(id))] as usize,
-                    1,
-                );
-            }
+            app.apply_fonts();
             for f in old {
                 DeleteObject(f);
             }
@@ -919,17 +1318,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 DestroyWindow(hwnd);
             }
             0
-        }
-        WM_DESTROY => {
-            KillTimer(hwnd, 1);
-            PostQuitMessage(0);
-            0
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let dc = w as HDC;
-            SetBkColor(dc, GetSysColor(COLOR_WINDOW));
-            SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-            GetSysColorBrush(COLOR_WINDOW) as isize
         }
         SHOW => {
             ShowWindow(hwnd, SW_RESTORE);

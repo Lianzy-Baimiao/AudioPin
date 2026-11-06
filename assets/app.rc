@@ -3,8 +3,8 @@ LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
 1 RT_MANIFEST "app.manifest"
 1 ICON "app.ico"
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION 0,1,2,0
+PRODUCTVERSION 0,1,2,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -13,9 +13,9 @@ BEGIN
   BLOCK "040904B0"
   BEGIN
    VALUE "FileDescription", "AudioPin - Audio Guardian\0"
-   VALUE "FileVersion", "0.1.0\0"
+   VALUE "FileVersion", "0.1.2\0"
    VALUE "ProductName", "AudioPin\0"
-   VALUE "ProductVersion", "0.1.0\0"
+   VALUE "ProductVersion", "0.1.2\0"
    VALUE "LegalCopyright", "Copyright (c) 2026 Lianzy-Baimiao\0"
   END
  END

@@ -5,6 +5,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 mode = parser.add_mutually_exclusive_group()
 mode.add_argument('--recover', action='store_true')
 mode.add_argument('--test-watchdog', action='store_true')
+mode.add_argument('--test-paused', action='store_true', help='With guard paused, assert a disabled input stays disabled, then restore it')
 parser.add_argument('--diagnose-exe', type=Path, default=Path(os.environ['LOCALAPPDATA']) / 'Programs/AudioPin/AudioPin.exe')
 args = parser.parse_args()
 def capture_active():
@@ -46,7 +47,7 @@ try:
  if args.recover and not state:
   request(0x87,0x978,0xa7c,1)
   assert request(0x86,0x868,0x96c)==1
- if args.test_watchdog:
+ if args.test_watchdog or args.test_paused:
   assert state == 1, 'Expected enabled initial state'
   assert capture_active(), 'Expected AMD to be actively capturing the pinned microphone before injection'
   started=time.monotonic()
@@ -54,13 +55,18 @@ try:
    request(0x87,0x978,0xa7c,0)
    assert request(0x86,0x868,0x96c)==0, 'Fault injection did not disable microphone suppression'
    print('RED: AMD runtime suppression is OFF')
-   while time.monotonic()-started < 20:
+   if args.test_paused:
+    time.sleep(6)
+    assert request(0x86,0x868,0x96c)==0, 'Paused guard wrote to AMD'
+    print('GREEN: paused guard left the disabled state unchanged for 6 seconds')
+   while not args.test_paused and time.monotonic()-started < 20:
     time.sleep(0.5)
     if request(0x86,0x868,0x96c)==1 and capture_active():
      print('GREEN: runtime flag AND AMD Windows capture session recovered in %.2f seconds' % (time.monotonic()-started));break
-   else: raise AssertionError('Watchdog did not restore live capture within 20 seconds')
+   else:
+    if not args.test_paused: raise AssertionError('Watchdog did not restore live capture within 20 seconds')
   finally:
-   request(0x87,0x978,0xa7c,1)
+   if request(0x86,0x868,0x96c)==0: request(0x87,0x978,0xa7c,1)
 finally:
  k.UnmapViewOfFile(p)
  for x in [h,s,d,mutex]: k.CloseHandle(x)

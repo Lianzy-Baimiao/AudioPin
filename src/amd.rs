@@ -124,7 +124,12 @@ impl Amd {
             })
         }
     }
-    fn request(&self, device: Option<&str>, enabled: Option<bool>) -> Result<bool> {
+    fn request(
+        &self,
+        device: Option<&str>,
+        enabled: Option<bool>,
+        current: impl Fn() -> bool,
+    ) -> Result<bool> {
         let id = device.map(wide);
         if let Some(device) = device {
             if id.as_ref().unwrap().len() > 128 || device.is_empty() || device.contains('\0') {
@@ -144,7 +149,18 @@ impl Amd {
                 0,
                 wide(r"Local\AudioPin.AmdIpc.v1").as_ptr(),
             ))?;
-            let acquired = WaitForSingleObject(mutex.0, 6000);
+            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            let acquired = loop {
+                if !current() {
+                    bail!("守护设置已改变，AMD 请求已取消");
+                }
+                let result = WaitForSingleObject(mutex.0, 50);
+                if result != windows_sys::Win32::Foundation::WAIT_TIMEOUT
+                    || std::time::Instant::now() >= lock_deadline
+                {
+                    break result;
+                }
+            };
             if acquired != WAIT_OBJECT_0
                 && acquired != windows_sys::Win32::Foundation::WAIT_ABANDONED
             {
@@ -159,6 +175,9 @@ impl Amd {
                 }
             }
             let _lock = Lock(mutex);
+            if !current() {
+                bail!("守护设置已改变，AMD 请求已取消");
+            }
             let p = self.view.Value.cast::<u8>();
             // Only touch the verified command's fields. Never create or resize AMD's map.
             if let Some(id) = &id {
@@ -171,7 +190,9 @@ impl Amd {
             ptr::write_volatile(p.add(result).cast::<i32>(), i32::MIN);
             ptr::write_volatile(p.add(offset - 8).cast::<u64>(), 0);
             ptr::write_volatile(p.add(0x818).cast::<u32>(), command);
-            if ResetEvent(self.done.0) == 0 || SetEvent(self.start.0) == 0 {
+            // The completion event is shared; do not reset a response belonging
+            // to Radeon. Command-specific fields determine completion below.
+            if SetEvent(self.start.0) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
             // AMD's completion event is shared with Radeon Software and auto-reset.
@@ -194,8 +215,10 @@ impl Amd {
                 WaitForSingleObject(self.done.0, 50);
             }
             if let Some(id) = &id {
-                let returned = std::slice::from_raw_parts(p.add(offset).cast::<u16>(), id.len());
-                if returned != id {
+                let returned: Vec<_> = (0..id.len())
+                    .map(|i| ptr::read_volatile(p.add(offset).cast::<u16>().add(i)))
+                    .collect();
+                if returned != *id {
                     bail!("AMD 响应设备不匹配，将稍后重试");
                 }
             }
@@ -209,16 +232,14 @@ impl Amd {
         }
     }
     pub fn state(&self, device: &str) -> Result<bool> {
-        self.request(Some(device), None)
+        self.request(Some(device), None, || true)
     }
-    pub fn initialize(&self) -> Result<()> {
-        self.request(None, None).map(|_| ())
+    pub fn initialize(&self, current: impl Fn() -> bool) -> Result<()> {
+        self.request(None, None, current).map(|_| ())
     }
-    pub fn enable(&self, device: &str) -> Result<()> {
-        self.request(Some(device), Some(true))?;
-        if !self.state(device)? {
-            bail!("AMD 接收了开启命令，但运行状态仍为关闭");
-        }
-        Ok(())
+    pub fn enable(&self, device: &str, current: impl Fn() -> bool) -> Result<()> {
+        // The next observation verifies GET and live capture. Never send a
+        // second request immediately while AMD is rebuilding the input stream.
+        self.request(Some(device), Some(true), current).map(|_| ())
     }
 }

@@ -2,15 +2,17 @@ use crate::{
     amd,
     audio::{AppPolicy, Audio, Com, Device},
     config::{data_dir, Config},
+    engine::{AmdObservation, Backend, Engine, Process, State},
     platform,
 };
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::HashMap,
+    collections::VecDeque,
     fs::{self, OpenOptions},
     io::Write,
     sync::{
-        mpsc::{self, Receiver, Sender},
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -20,9 +22,11 @@ use std::{
 pub struct Snapshot {
     pub title: String,
     pub detail: String,
+    pub amd_detail: String,
+    pub route_detail: String,
     pub devices: Vec<Device>,
     pub events: Vec<String>,
-    pub pending_notification: Option<String>,
+    pub notifications: VecDeque<String>,
     pub healthy: bool,
     pub repaired: u64,
     pub checks: u64,
@@ -36,460 +40,347 @@ pub enum Command {
     Stop,
 }
 pub type Shared = Arc<Mutex<Snapshot>>;
-pub fn start(config: Config) -> (Sender<Command>, Shared, std::thread::JoinHandle<()>) {
+pub struct Control {
+    tx: mpsc::Sender<(u64, Command)>,
+    generation: Arc<AtomicU64>,
+}
+impl Control {
+    pub fn send(&self, command: Command) -> Result<()> {
+        let generation = if matches!(command, Command::Check) {
+            self.generation.load(Ordering::SeqCst)
+        } else {
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        self.tx
+            .send((generation, command))
+            .context("守护线程已停止，请重启 AudioPin")
+    }
+}
+pub fn start(config: Config) -> (Control, Shared, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
+    let generation = Arc::new(AtomicU64::new(0));
     let shared = Arc::new(Mutex::new(Snapshot {
         title: "正在检查".into(),
-        update: "尚未检查 GitHub 更新".into(),
+        update: "尚未检查更新".into(),
         ..Default::default()
     }));
     let state = shared.clone();
+    let revision = generation.clone();
     let thread = std::thread::spawn(move || {
-        if let Err(e) = run(config, rx, state.clone()) {
+        if let Err(e) = run(config, rx, revision, state.clone()) {
             let mut s = state.lock().unwrap();
-            s.title = "守护未启动".into();
+            s.title = "守护已停止".into();
             s.detail = format!("{e:#}");
+            s.healthy = false;
+            s.notifications.push_back(format!("守护已停止：{e:#}"));
             log(&mut s, &format!("守护线程错误：{e:#}"));
         }
     });
-    (tx, shared, thread)
+    (Control { tx, generation }, shared, thread)
 }
 
-/// Retry state is independent from UI and notifications. Missing devices never trigger writes.
-#[derive(Default)]
-pub struct Backoff {
-    failures: u32,
-    next: Option<Instant>,
+struct WindowsBackend<'a> {
+    audio: &'a Audio,
+    processes: &'a [Process],
+    generation: &'a AtomicU64,
+    revision: u64,
+    profile_error: Option<&'a str>,
 }
-impl Backoff {
-    fn ready(&self, now: Instant) -> bool {
-        self.next.is_none_or(|n| now >= n)
-    }
-    fn fail(&mut self, now: Instant, max: u64) {
-        self.failures = self.failures.saturating_add(1);
-        self.next =
-            Some(now + Duration::from_secs((2u64.saturating_pow(self.failures.min(10))).min(max)));
-    }
-    fn reset(&mut self) {
-        self.failures = 0;
-        self.next = None;
+impl WindowsBackend<'_> {
+    fn check_current(&self) -> Result<()> {
+        if !self.current() {
+            bail!("新的设置正在应用，已取消旧设置写入");
+        }
+        Ok(())
     }
 }
-#[derive(Default)]
-struct Recovery {
-    pending: bool,
-    sent_at: Option<Instant>,
-}
-#[derive(Debug, PartialEq)]
-enum RecoveryAction {
-    Ready,
-    Wait,
-    Repair,
-}
-impl Recovery {
-    fn action(
-        &self,
-        enabled: bool,
-        configured: bool,
-        capturing: bool,
-        now: Instant,
-    ) -> RecoveryAction {
-        if enabled && configured && capturing {
-            RecoveryAction::Ready
-        } else if self
-            .sent_at
-            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(6))
-        {
-            RecoveryAction::Wait
-        } else {
-            RecoveryAction::Repair
+impl Backend for WindowsBackend<'_> {
+    fn current(&self) -> bool {
+        self.generation.load(Ordering::SeqCst) == self.revision
+    }
+    fn amd_observe(&mut self, id: &str) -> Result<AmdObservation> {
+        if let Some(e) = self.profile_error {
+            bail!("{e}");
+        }
+        let pids = platform::amd_process_ids()?;
+        if pids.is_empty() {
+            return Ok(AmdObservation::Missing);
+        }
+        let ipc = amd::Amd::connect()?;
+        let enabled = match ipc.state(id) {
+            Ok(state) => state,
+            Err(e) if amd::uninitialized(&e) => return Ok(AmdObservation::Initializing),
+            Err(e) => return Err(e),
+        };
+        let configured =
+            amd::configured_on()? && amd::input_is_pinned()? && amd::configured_input() == id;
+        let capturing = self
+            .audio
+            .capture_sessions(id)?
+            .iter()
+            .any(|s| s.active && pids.contains(&s.process_id));
+        Ok(AmdObservation::Running {
+            enabled,
+            configured,
+            capturing,
+        })
+    }
+    fn amd_repair(&mut self, id: &str, observed: &AmdObservation) -> Result<()> {
+        self.check_current()?;
+        // Recheck the binary immediately before a private-protocol mutation.
+        amd::supported()?;
+        self.check_current()?;
+        amd::configure(id)?;
+        self.check_current()?;
+        match observed {
+            AmdObservation::Missing => {
+                // A concurrently started verified backend should be observed on
+                // the next cycle, not launched a second time.
+                if platform::amd_process_ids()?.is_empty() {
+                    platform::hidden_command(amd::executable())
+                        .arg("NoQuit")
+                        .current_dir(amd::executable().parent().context("AMD 安装目录无效")?)
+                        .spawn()
+                        .context("启动 AMD 后台失败")?;
+                }
+                Ok(())
+            }
+            AmdObservation::Initializing => amd::Amd::connect()?.initialize(|| self.current()),
+            AmdObservation::Running { .. } => amd::Amd::connect()?.enable(id, || self.current()),
         }
     }
-    fn sent(&mut self) {
-        self.pending = true;
-        self.sent_at = Some(Instant::now());
+    fn default(&mut self, role: i32) -> Result<String> {
+        self.audio.default(role)
+    }
+    fn set_default(&mut self, role: i32, id: &str) -> Result<()> {
+        self.check_current()?;
+        self.audio.set_default(id, role)
+    }
+    fn app_get(&mut self, process: &Process, role: i32) -> Result<String> {
+        platform::verify_process(process)?;
+        AppPolicy::new()?.get(process.pid, role)
+    }
+    fn app_set(&mut self, process: &Process, role: i32, id: &str) -> Result<()> {
+        self.check_current()?;
+        if !self.processes.contains(process) {
+            bail!("目标进程已改变");
+        }
+        platform::verify_process(process)?;
+        AppPolicy::new()?.set_raw(process.pid, role, id)
     }
 }
-fn run(mut config: Config, rx: Receiver<Command>, shared: Shared) -> Result<()> {
+fn run(
+    mut config: Config,
+    rx: Receiver<(u64, Command)>,
+    generation: Arc<AtomicU64>,
+    shared: Shared,
+) -> Result<()> {
     let _com = Com::init()?;
-    let audio = Audio::new()?;
-    let mut profile_error = amd::supported().err().map(|e| e.to_string());
-    let mut profile_stamp = fs::metadata(amd::executable())
-        .ok()
-        .map(|m| (m.len(), m.modified().ok()));
-    let mut retry = Backoff::default();
-    let mut previous = String::new();
-    let mut last_notification: Option<Instant> = None;
-    let mut last_devices: Vec<(String, bool)> = vec![];
-    let mut startup_attempt = None;
-    let mut recovery = Recovery::default();
-    let mut route_originals: HashMap<(u32, String, i32), (String, String)> = HashMap::new();
-    let mut default_originals: HashMap<i32, (String, String)> = HashMap::new();
+    // Windows Audio can still be starting at login. Keep the worker alive and
+    // recreate the enumerator on the next cycle instead of exiting permanently.
+    let mut audio = None;
+    let mut engine = Engine::default();
+    engine.apply(&config);
+    let mut revision = 0;
     let mut first = true;
+    let mut profile_error = amd::supported().err().map(|e| format!("{e:#}"));
+    let mut stamp = profile_stamp();
+    let mut previous = String::new();
+    let mut last_event_notification = None;
+    let mut last_processes = Vec::new();
     loop {
-        if !first {
+        let received = if first {
+            first = false;
+            None
+        } else {
             match rx.recv_timeout(Duration::from_secs(config.poll_seconds)) {
-                Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Ok(Command::Apply(c)) => {
-                    if c.physical_input != config.physical_input || !c.amd_enabled {
-                        recovery = Recovery::default();
-                    }
+                Ok(c) => Some(c),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        // Drain queued configuration changes before doing another observation.
+        // Generation checks also cancel writes in an already-running cycle.
+        for (next, command) in received.into_iter().chain(rx.try_iter()) {
+            match command {
+                Command::Stop => return Ok(()),
+                Command::Apply(c) => {
                     config = c;
-                    retry.reset();
+                    revision = next;
+                    engine.apply(&config);
                 }
-                Ok(Command::Pause(pause)) => {
+                Command::Pause(pause) => {
                     config.guard_enabled = !pause;
-                    recovery = Recovery::default();
-                    retry.reset();
+                    revision = next;
+                    engine.apply(&config);
                 }
-                Ok(Command::Check) => retry.reset(),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Command::Check => engine.reset_retries(),
             }
         }
-        first = false;
-        let now = Instant::now();
-        let stamp = fs::metadata(amd::executable())
-            .ok()
-            .map(|m| (m.len(), m.modified().ok()));
-        if stamp != profile_stamp {
-            profile_error = amd::supported().err().map(|e| e.to_string());
-            profile_stamp = stamp;
-            retry.reset();
+        let current_stamp = profile_stamp();
+        if current_stamp != stamp {
+            profile_error = amd::supported().err().map(|e| format!("{e:#}"));
+            stamp = current_stamp;
+            engine.reset_retries();
         }
-        let mut changes = vec![];
-        let devices = match audio.devices() {
+        let devices_result = (|| -> Result<Vec<Device>> {
+            if audio.is_none() {
+                audio = Some(Audio::new()?);
+            }
+            audio.as_ref().context("音频服务尚未就绪")?.devices()
+        })();
+        let devices = match devices_result {
             Ok(d) => d,
             Err(e) => {
+                audio = None;
+                if generation.load(Ordering::SeqCst) != revision {
+                    continue;
+                }
+                let mut s = shared.lock().unwrap();
+                s.devices.clear();
+                s.amd_detail = "音频服务不可用，采集状态未知".into();
+                s.route_detail = "音频服务不可用，输入状态未知".into();
+                s.checks += 1;
                 publish(
-                    &shared,
+                    &mut s,
                     &config,
                     "音频服务不可用",
                     &format!("{e:#}"),
                     false,
                     &mut previous,
-                    &mut last_notification,
+                    &mut last_event_notification,
                     vec![],
+                    false,
                 );
                 continue;
             }
         };
-        let device_states: Vec<_> = devices.iter().map(|d| (d.id.clone(), d.active)).collect();
-        if device_states != last_devices {
-            retry.reset();
-            last_devices = device_states;
-            changes.push("音频设备列表/连接状态已更新".into());
+        let configured_apps = if config.pin_apps && config.guard_enabled {
+            config.apps.as_slice()
+        } else {
+            &[]
+        };
+        let process_result = platform::tracked_processes(&engine.process_names(configured_apps));
+        if let Ok(processes) = &process_result {
+            last_processes = processes.clone();
         }
-        shared.lock().unwrap().devices = devices.clone();
-        let process_list = platform::processes().unwrap_or_default();
-        if !config.pin_apps {
-            shared.lock().unwrap().apps = "Windows 应用输入偏好守护未启用；实际输入未知".into();
-        }
-        // Restore only settings this process actually changed, and only if still ours.
-        if !route_originals.is_empty() {
-            if let Ok(policy) = AppPolicy::new() {
-                route_originals.retain(|(pid, name, role), (original, applied)| {
-                    if !process_list.iter().any(|(p, n)| p == pid && n == name) {
-                        return false;
-                    }
-                    if config.guard_enabled
-                        && config.pin_apps
-                        && config.apps.iter().any(|a| a.eq_ignore_ascii_case(name))
-                    {
-                        return true;
-                    }
-                    match policy.get(*pid, *role) {
-                        Ok(current) if current == *applied => {
-                            match policy.set_raw(*pid, *role, original) {
-                                Ok(()) => false,
-                                Err(e) => {
-                                    changes.push(format!("恢复应用路由失败：{e}"));
-                                    true
-                                }
-                            }
-                        }
-                        Ok(_) => false,
-                        Err(_) => true,
-                    }
-                });
+        let processes = &last_processes;
+        let mut backend = WindowsBackend {
+            audio: audio.as_ref().context("音频服务尚未就绪")?,
+            processes,
+            generation: &generation,
+            revision,
+            profile_error: profile_error.as_deref(),
+        };
+        let before = engine.repaired;
+        let mut cycle = engine.cycle(&config, &devices, processes, &mut backend, Instant::now());
+        if config.guard_enabled && config.pin_apps {
+            if let Err(e) = process_result {
+                cycle.routes.state = State::Error;
+                cycle.routes.detail = format!("无法检查应用进程：{e:#}");
             }
         }
-        for role in [0, 1, 2] {
-            let pin = config.guard_enabled
-                && if role == 2 {
-                    config.pin_communications
-                } else {
-                    config.pin_default
-                };
-            if !pin {
-                if let Some((original, applied)) = default_originals.remove(&role) {
-                    if audio.default(role).ok().as_deref() == Some(applied.as_str()) {
-                        if let Err(e) = audio.set_default(&original, role) {
-                            changes.push(format!("恢复默认设备失败：{e}"));
-                            default_originals.insert(role, (original, applied));
-                        }
-                    }
-                }
-            }
-        }
-        if !config.guard_enabled {
-            shared.lock().unwrap().apps = "守护已暂停；应用实际输入未知".into();
-            publish(
-                &shared,
-                &config,
-                "守护已暂停",
-                "不会自动开启降噪或更改音频输入。点击“恢复守护”继续。",
-                false,
-                &mut previous,
-                &mut last_notification,
-                changes,
-            );
+        // Never publish a stale healthy result after a Pause/Apply was queued.
+        if generation.load(Ordering::SeqCst) != revision {
             continue;
         }
-        if !retry.ready(now) {
-            continue;
-        }
-        if config.pin_apps {
-            shared.lock().unwrap().apps = "本轮 Windows 偏好检查尚未完成；应用实际输入未知".into();
-        }
-        let outcome = (|| -> Result<(String, String)> {
-            if config.amd_enabled {
-                if let Some(error) = &profile_error {
-                    bail!("{error}");
-                }
-                if config.physical_input.is_empty() {
-                    bail!("请在“设备与路由”选择 AMD 使用的原始麦克风并保存");
-                }
-                let physical = devices
-                    .iter()
-                    .find(|d| d.id == config.physical_input && d.active)
-                    .context("原始麦克风已断开，等待原设备重连；不会切换到远程虚拟麦克风")?;
-                if physical.amd {
-                    bail!("原始输入不能选择 AMD 降噪虚拟设备");
-                }
-                if !process_list
-                    .iter()
-                    .any(|(_, n)| n.eq_ignore_ascii_case("AMDNoiseSuppression.exe"))
-                {
-                    if !config.restart_amd_if_missing {
-                        bail!("AMD 后台未运行；自动启动后台选项已关闭");
-                    }
-                    if startup_attempt
-                        .is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(30))
-                    {
-                        // The backend initializes asynchronously from this configuration.
-                        // Set it before launch and allow that initialization to finish
-                        // before attempting a device SET on the new process.
-                        amd::configure(&config.physical_input)?;
-                        platform::hidden_command(amd::executable())
-                            // Radeon uses NoQuit: without it AMD exits while its global
-                            // registry toggle is off, which is precisely when we need it.
-                            .arg("NoQuit")
-                            .current_dir(amd::executable().parent().context("AMD 安装目录无效")?)
-                            .spawn()
-                            .context("启动 AMD 后台失败")?;
-                        startup_attempt = Some(now);
-                        recovery.sent();
-                        changes.push("AMD 后台缺失，已请求启动".into());
-                    }
-                    bail!("等待 AMD 后台启动");
-                }
-                let ipc = amd::Amd::connect()?;
-                let enabled = match ipc.state(&config.physical_input) {
-                    Ok(enabled) => enabled,
-                    Err(e)
-                        if amd::uninitialized(&e)
-                            && recovery.action(false, false, false, Instant::now())
-                                == RecoveryAction::Wait =>
-                    {
-                        return Ok((
-                            "正在恢复".into(),
-                            "AMD 后台正在初始化，等待就绪后复查麦克风采集。".into(),
-                        ));
-                    }
-                    Err(e) if amd::uninitialized(&e) => {
-                        recovery.pending = true;
-                        amd::configure(&config.physical_input)?;
-                        ipc.initialize()?;
-                        recovery.sent();
-                        changes.push("AMD 音频处理引擎未初始化，已完成初始化请求".into());
-                        ipc.state(&config.physical_input)?
-                    }
-                    Err(e) => return Err(e),
-                };
-                let configured = amd::configured_on()?
-                    && amd::input_is_pinned()?
-                    && amd::configured_input() == config.physical_input;
-                let capturing = audio
-                    .capture_sessions(&config.physical_input)?
-                    .iter()
-                    .any(|s| {
-                        s.active
-                            && process_list.iter().any(|(pid, name)| {
-                                *pid == s.process_id
-                                    && name.eq_ignore_ascii_case("AMDNoiseSuppression.exe")
-                            })
-                    });
-                match recovery.action(enabled, configured, capturing, Instant::now()) {
-                    RecoveryAction::Ready => {}
-                    RecoveryAction::Wait => {
-                        return Ok(("正在恢复".into(), "已发送恢复命令，等待 AMD 在指定麦克风上的采集会话启动；尚未确认恢复成功。".into()));
-                    }
-                    RecoveryAction::Repair => {
-                        let stalled = recovery.sent_at.is_some() && !capturing;
-                        changes.push(format!("检测到 AMD 降噪/输入偏离（运行开关：{enabled}，AMD 采集会话：{capturing}）"));
-                        recovery.sent();
-                        amd::configure(&config.physical_input)?;
-                        ipc.enable(&config.physical_input)?;
-                        if stalled {
-                            bail!("AMD 开关已开启，但指定麦克风的采集会话尚未恢复；已重发开启命令，将继续重试");
-                        }
-                        retry.reset();
-                        return Ok(("正在恢复".into(), "已发送恢复命令，等待 AMD 在指定麦克风上的采集会话启动；尚未确认恢复成功。".into()));
-                    }
-                }
+        let all = [&cycle.amd.state, &cycle.routes.state];
+        let enabled = all.iter().any(|s| **s != State::Disabled);
+        let healthy = config.guard_enabled
+            && enabled
+            && all
+                .iter()
+                .all(|s| matches!(s, State::Ready | State::Disabled));
+        let title = if !config.guard_enabled {
+            "守护已暂停"
+        } else if all.contains(&&State::Error) {
+            "需要关注"
+        } else if all.contains(&&State::Repairing) {
+            "正在恢复"
+        } else if all.contains(&&State::Waiting) {
+            "等待设备或设置"
+        } else if enabled {
+            "守护运行中"
+        } else {
+            "尚未启用守护项目"
+        };
+        let detail = if !config.guard_enabled {
+            if cycle.routes.state == State::Error {
+                format!(
+                    "已停止守护写入；部分旧路由还原失败：{}",
+                    cycle.routes.detail
+                )
+            } else {
+                "自动恢复已暂停。音频设备保持当前可用状态。".into()
             }
-            let routing = config.pin_default || config.pin_communications || config.pin_apps;
-            if routing {
-                if config.output_input.is_empty() {
-                    bail!("请选择提供给语音软件的输入设备");
-                }
-                if !devices
-                    .iter()
-                    .any(|d| d.id == config.output_input && d.active)
-                {
-                    bail!("目标输入设备离线，等待重连后恢复路由");
-                }
-                for role in [0, 1, 2] {
-                    if (role == 2 && !config.pin_communications)
-                        || (role != 2 && !config.pin_default)
-                    {
-                        continue;
-                    }
-                    let old = audio.default(role)?;
-                    if old != config.output_input {
-                        let record = default_originals
-                            .entry(role)
-                            .or_insert((old, config.output_input.clone()));
-                        audio.set_default(&config.output_input, role)?;
-                        record.1 = config.output_input.clone();
-                        changes.push(format!(
-                            "已恢复 Windows {}输入",
-                            if role == 2 { "通信" } else { "默认" }
-                        ));
-                    }
-                }
-                if config.pin_apps {
-                    let policy = AppPolicy::new()?;
-                    let target = AppPolicy::full_id(&config.output_input);
-                    let mut active = vec![];
-                    for (pid, name) in &process_list {
-                        if !config.apps.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-                            continue;
-                        }
-                        for role in [0, 1, 2] {
-                            let old = policy.get(*pid, role)?;
-                            if old != target {
-                                let record = route_originals
-                                    .entry((*pid, name.clone(), role))
-                                    .or_insert((old, target.clone()));
-                                policy.set_raw(*pid, role, &target)?;
-                                record.1 = target.clone();
-                                changes.push(format!(
-                                    "已写入并读回 {name} 的 Windows 输入偏好（PID {pid}，角色 {role}）；应用实际输入未验证"
-                                ));
-                            }
-                        }
-                        active.push(format!(
-                            "{name} · PID {pid} · Windows 偏好值一致；实际输入未知"
-                        ));
-                    }
-                    shared.lock().unwrap().apps = if active.is_empty() {
-                        "未发现配置中的进程；应用实际输入未知".into()
-                    } else {
-                        active.join("\r\n")
-                    };
-                }
-            }
-            if config.amd_enabled && recovery.pending {
-                changes.push("AMD 麦克风降噪已自动恢复：后台开启，指定麦克风的 AMD 采集会话已活动，输入路由复查通过".into());
-                shared.lock().unwrap().repaired += 1;
-                recovery = Recovery::default();
-            }
-            retry.reset();
-            Ok((
-                "正在守护".into(),
-                if config.amd_enabled {
-                    "AMD 后台开关已开启，正在采集指定物理麦克风。\r\nAMD 设置面板可能仍显示“关闭”；此处独立检查 Windows 采集会话。未评估降噪效果或通话软件的实际输入。".into()
-                } else {
-                    "AMD 守护已关闭。按配置固定 Windows / 应用输入路由。".into()
-                },
-            ))
-        })();
-        shared.lock().unwrap().checks += 1;
-        match outcome {
-            Ok((title, detail)) => {
-                let healthy = title == "正在守护";
-                publish(
-                    &shared,
-                    &config,
-                    &title,
-                    &detail,
-                    healthy,
-                    &mut previous,
-                    &mut last_notification,
-                    changes,
-                );
-            }
-            Err(e) => {
-                retry.fail(now, config.retry_max_seconds);
-                publish(
-                    &shared,
-                    &config,
-                    "需要关注",
-                    &format!("{e:#}"),
-                    false,
-                    &mut previous,
-                    &mut last_notification,
-                    changes,
-                );
-            }
-        }
+        } else if healthy {
+            "后台状态与 Windows 输入已检查。通话输入和降噪效果需在语音软件中确认。".into()
+        } else {
+            format!("{}\r\n{}", cycle.amd.detail, cycle.routes.detail)
+        };
+        let mut s = shared.lock().unwrap();
+        s.devices = devices;
+        s.amd_detail = cycle.amd.detail;
+        s.route_detail = cycle.routes.detail;
+        s.apps = cycle.apps;
+        s.checks += 1;
+        s.repaired = engine.repaired;
+        publish(
+            &mut s,
+            &config,
+            title,
+            &detail,
+            healthy,
+            &mut previous,
+            &mut last_event_notification,
+            cycle.events,
+            engine.repaired > before,
+        );
     }
     Ok(())
 }
+fn profile_stamp() -> Option<(u64, Option<std::time::SystemTime>)> {
+    fs::metadata(amd::executable())
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()))
+}
 #[allow(clippy::too_many_arguments)]
 fn publish(
-    shared: &Shared,
+    s: &mut Snapshot,
     c: &Config,
     title: &str,
     detail: &str,
     healthy: bool,
     previous: &mut String,
     last: &mut Option<Instant>,
-    changes: Vec<String>,
+    events: Vec<String>,
+    recovered: bool,
 ) {
-    let mut s = shared.lock().unwrap();
     s.title = title.into();
     s.detail = detail.into();
     s.healthy = healthy;
     let key = format!("{title}|{detail}");
     let changed = *previous != key;
     if changed {
-        log(&mut s, &format!("{title}：{detail}"));
+        log(s, &format!("{title}：{detail}"));
         *previous = key;
     }
-    for msg in &changes {
-        log(&mut s, msg);
+    for msg in &events {
+        log(s, msg);
     }
     if c.notifications
         && (changed
-            || (!changes.is_empty()
+            || recovered
+            || (!events.is_empty()
                 && last.is_none_or(|t| {
                     t.elapsed() >= Duration::from_secs(c.notification_cooldown_seconds)
                 })))
     {
-        s.pending_notification = Some(if changes.iter().any(|c| c.contains("自动恢复")) {
-            "AMD 麦克风降噪已自动恢复".into()
+        if s.notifications.len() >= 16 {
+            s.notifications.pop_front();
+        }
+        s.notifications.push_back(if recovered {
+            "AMD 后台恢复已确认；指定麦克风采集活动".into()
         } else {
             format!("{title}：{detail}")
         });
@@ -525,57 +416,5 @@ pub fn log(s: &mut Snapshot, text: &str) {
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{line}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn retry_is_bounded_and_resets_after_reconnect() {
-        let now = Instant::now();
-        let mut b = Backoff::default();
-        assert!(b.ready(now));
-        b.fail(now, 60);
-        assert!(!b.ready(now + Duration::from_secs(1)));
-        assert!(b.ready(now + Duration::from_secs(2)));
-        for _ in 0..40 {
-            b.fail(now, 60);
-        }
-        assert!(!b.ready(now + Duration::from_secs(59)));
-        assert!(b.ready(now + Duration::from_secs(60)));
-        b.reset();
-        assert!(b.ready(now));
-    }
-    #[test]
-    fn enabled_flag_without_capture_is_not_a_recovery() {
-        let now = Instant::now();
-        let mut recovery = Recovery::default();
-        assert_eq!(
-            recovery.action(true, true, false, now),
-            RecoveryAction::Repair
-        );
-        recovery.sent();
-        let now = Instant::now();
-        assert_eq!(
-            recovery.action(true, true, false, now),
-            RecoveryAction::Wait
-        );
-        assert_eq!(
-            recovery.action(true, true, true, now),
-            RecoveryAction::Ready
-        );
-        assert_eq!(
-            recovery.action(false, true, true, now),
-            RecoveryAction::Wait
-        );
-        assert_eq!(
-            recovery.action(true, false, true, now),
-            RecoveryAction::Wait
-        );
-        assert_eq!(
-            recovery.action(true, true, false, now + Duration::from_secs(7)),
-            RecoveryAction::Repair
-        );
     }
 }

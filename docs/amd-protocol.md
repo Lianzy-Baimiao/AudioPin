@@ -16,7 +16,7 @@
 | GET_ANS_STATE | 0x86 | 0x868 | 0x968 | 0x96c | 0x860 |
 | SET_ANS_STATE | 0x87 | 0x978 | 0xa78 | 0xa7c | 0x970 |
 
-请求命令 DWORD 位于 `0x818`。返回码 `0` 为成功；仅 START_ANS_PROCESS 还接受 `1`（已初始化）。GET/SET 返回 `-2` 表示引擎尚未初始化，不能解释成设备断开；守护发送初始化后重新 GET。写入前清空相关返回码和时间标记；请求后检查返回设备、命令专属响应标记和返回码。完成事件为自动复位且与 Radeon Software 共用，可能被其他客户端先消费，因此使用 50 ms 有界等待同时检查响应字段，而非仅依赖完成事件或易变的全局命令值。设置完成后再次 GET 验证。AudioPin 的 UI、诊断工具、测试脚本通过 `Local\AudioPin.AmdIpc.v1` 互斥串行请求；AMD Radeon Software 不共享此锁，发生竞用时检测不一致并退避。
+请求命令 DWORD 位于 `0x818`。返回码 `0` 为成功；仅 START_ANS_PROCESS 还接受 `1`（已初始化）。GET/SET 返回 `-2` 表示引擎尚未初始化，不能解释成设备断开；守护发送初始化后重新 GET。写入前清空相关返回码和时间标记；请求后检查返回设备、命令专属响应标记和返回码。完成事件为自动复位且与 Radeon Software 共用，可能被其他客户端先消费，因此使用 50 ms 有界等待同时检查响应字段，而非仅依赖完成事件或易变的全局命令值。v0.1.2 在下一次守护周期重新 GET 并核对采集会话，不再在 SET 后立即附加一次请求。等待互斥期间收到暂停/新设置会取消尚未发送的请求；不再重置共用完成事件。AudioPin 的 UI、诊断工具、测试脚本通过 `Local\AudioPin.AmdIpc.v1` 互斥串行请求；AMD Radeon Software 不共享此锁，发生竞用时检测不一致并退避。
 
 配置值位于 `HKCU\Software\AMD\CN\Audio`：
 
@@ -24,7 +24,7 @@
 - `ANRAudioInputUseDefault`: REG_SZ `false`
 - `ANRAudioInputDevice`: 原始输入 endpoint ID
 
-这些值只在偏离时写入。进程存活和注册表状态都不能单独证明麦克风降噪开启。v0.1.1 除后台 GET 外，还通过 Windows `IAudioSessionManager2` 查询目标物理输入上的活动会话，要求 PID 对应 AMDNoiseSuppression.exe，且配置的路由检查成功，才累计恢复次数和通知成功。不创建录音流、不读取音频内容、不验证算法效果。开启命令成功后采集会话可能延迟出现，因此先报告“正在恢复”；长时间未出现则报错并退避重试。
+这些值只在偏离时写入。进程存活和注册表状态都不能单独证明麦克风降噪开启。自 v0.1.1 起，除后台 GET 外，还通过 Windows `IAudioSessionManager2` 查询目标物理输入上的活动会话，要求 PID 对应当前登录会话中安装路径匹配的 AMDNoiseSuppression.exe。v0.1.2 分别报告 AMD 与 Windows 路由状态：只有开关、物理输入配置和 AMD 活动采集均通过才累计 AMD 后台恢复次数；某项路由失败仍会显示总体异常。不创建录音流、不读取音频内容、不验证算法效果。开启命令成功后采集会话可能延迟出现，因此先报告“正在恢复”；长时间未出现则报错并退避重试。
 
 后台自动启动前写入目标配置，使用安装目录作为工作目录，并传入 `NoQuit` 参数。启动和初始化请求后进入等待状态，避免在 AMD 自身异步建立采集期间重复 SET 设备。已静态确认本机 `ANR-bgproc-Lib.dll` 使用此参数；AMDNoiseSuppression.exe 在全局配置关闭且没有该参数时直接退出。本机通过 AMD 面板关闭总开关重现了旧实现的启动失败。
 
