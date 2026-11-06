@@ -450,22 +450,22 @@ impl App {
         self.label(21, 3, "偏好设置", (240, 30, 680, 38));
         self.label(35, 3, "按你的使用习惯，调整后台守护。", (240, 73, 680, 24));
         self.checkbox(AUTOSTART, 3, "登录 Windows 时自动启动", 128);
-        self.checkbox(MINIMIZED, 3, "自动启动时隐藏到托盘", 168);
-        self.checkbox(CLOSE_TRAY, 3, "关闭窗口时保留托盘守护", 208);
-        self.checkbox(RESTART_AMD, 3, "AMD 后台退出后自动尝试启动", 248);
-        self.checkbox(NOTIFY, 3, "状态变化时显示 Windows 通知", 288);
+        self.checkbox(MINIMIZED, 3, "自动启动时隐藏到托盘", 164);
+        self.checkbox(CLOSE_TRAY, 3, "关闭窗口时保留托盘守护", 200);
+        self.checkbox(RESTART_AMD, 3, "AMD 后台退出后自动尝试启动", 236);
+        self.checkbox(NOTIFY, 3, "状态变化时显示 Windows 通知", 272);
         self.checkbox(
             RELOAD_AMD_PANEL,
             3,
-            "恢复后重载 AMD 面板（会关闭 AMD 窗口）",
-            328,
+            "恢复后同步 AMD 面板（会重启 AMD 窗口）",
+            308,
         );
-        self.label(22, 3, "检查间隔 / 秒（1–60）", (264, 367, 390, 26));
-        self.edit(POLL, 3, "2", (776, 362, 128, 30), ES_NUMBER as u32);
-        self.label(23, 3, "修复重试上限 / 秒（5–600）", (264, 413, 390, 26));
-        self.edit(RETRY, 3, "60", (776, 408, 128, 30), ES_NUMBER as u32);
-        self.label(24, 3, "重复修复通知间隔 / 秒", (264, 459, 390, 26));
-        self.edit(COOLDOWN, 3, "10", (776, 454, 128, 30), ES_NUMBER as u32);
+        self.label(22, 3, "检查间隔 / 秒（1–60）", (264, 387, 390, 26));
+        self.edit(POLL, 3, "2", (776, 382, 128, 30), ES_NUMBER as u32);
+        self.label(23, 3, "修复重试上限 / 秒（5–600）", (264, 433, 390, 26));
+        self.edit(RETRY, 3, "60", (776, 428, 128, 30), ES_NUMBER as u32);
+        self.label(24, 3, "重复修复通知间隔 / 秒", (264, 479, 390, 26));
+        self.edit(COOLDOWN, 3, "10", (776, 474, 128, 30), ES_NUMBER as u32);
         self.label(
             25,
             3,
@@ -500,7 +500,7 @@ impl App {
         self.label(
             29,
             4,
-            "AMD 面板状态同步尚未解决；降噪效果尚未验证。\r\n驱动版本变更后可能需要更新适配。",
+            "支持恢复 AMD 面板状态；实际降噪效果尚未验证。\r\n驱动版本变更后可能需要更新适配。",
             (264, 575, 640, 48),
         );
         self.apply_fonts();
@@ -1071,7 +1071,7 @@ unsafe fn window_message(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<L
                 1 => &[(112, 256), (268, 352), (360, 444), (496, 630)],
                 2 => &[(112, 306), (318, 526)],
                 3 => &[(112, 530)],
-                4 => &[(112, 332), (350, 516)],
+                4 => &[(112, 352), (370, 536)],
                 5 => &[(112, 222), (240, 554)],
                 _ => &[],
             };
