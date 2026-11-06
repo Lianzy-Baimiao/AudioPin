@@ -85,6 +85,7 @@ struct WindowsBackend<'a> {
     generation: &'a AtomicU64,
     revision: u64,
     profile_error: Option<&'a str>,
+    panel_reload: &'a mut Option<platform::PanelReload>,
 }
 impl WindowsBackend<'_> {
     fn check_current(&self) -> Result<()> {
@@ -149,6 +150,25 @@ impl Backend for WindowsBackend<'_> {
             AmdObservation::Running { .. } => amd::Amd::connect()?.enable(id, || self.current()),
         }
     }
+    fn amd_sync_panel(&mut self, input: &str) -> Result<bool> {
+        self.check_current()?;
+        if let Some(reload) = self.panel_reload.as_mut() {
+            let result = reload.poll();
+            let same_input = reload.matches_input(input);
+            if !matches!(result, Ok(false)) {
+                *self.panel_reload = None;
+            }
+            if !same_input && matches!(result, Ok(true)) {
+                // A configuration change must not inherit an old input's
+                // initialization confirmation. Start a fresh reload next cycle.
+                return Ok(false);
+            }
+            return result;
+        }
+        *self.panel_reload = platform::reload_amd_panel(input, || self.current())?;
+        Ok(self.panel_reload.is_none())
+    }
+
     fn default(&mut self, role: i32) -> Result<String> {
         self.audio.default(role)
     }
@@ -188,6 +208,7 @@ fn run(
     let mut previous = String::new();
     let mut last_event_notification = None;
     let mut last_processes = Vec::new();
+    let mut panel_reload = None;
     loop {
         let received = if first {
             first = false;
@@ -271,6 +292,7 @@ fn run(
             generation: &generation,
             revision,
             profile_error: profile_error.as_deref(),
+            panel_reload: &mut panel_reload,
         };
         let before = engine.repaired;
         let mut cycle = engine.cycle(&config, &devices, processes, &mut backend, Instant::now());
@@ -339,10 +361,18 @@ fn run(
     }
     Ok(())
 }
-fn profile_stamp() -> Option<(u64, Option<std::time::SystemTime>)> {
-    fs::metadata(amd::executable())
-        .ok()
-        .map(|m| (m.len(), m.modified().ok()))
+fn profile_stamp() -> Vec<Option<(u64, Option<std::time::SystemTime>)>> {
+    [
+        amd::executable(),
+        amd::executable().with_file_name("anronnxlib.dll"),
+    ]
+    .into_iter()
+    .map(|path| {
+        fs::metadata(path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
+    })
+    .collect()
 }
 #[allow(clippy::too_many_arguments)]
 fn publish(

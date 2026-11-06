@@ -11,6 +11,7 @@ use windows_sys::Win32::{
 use winreg::{enums::*, RegKey};
 
 const PROFILE_HASH: &str = "4ecec1b76d9ef18c7f2a26da823e71124db627e3acd3c178c89b80b3aeac20ee";
+const ENGINE_HASH: &str = "a34a6590a14a34d4a4b4155b63bc6357ed5654414ae3c04af0f791849179ac26";
 const MAP_SIZE: usize = 0x29e08;
 const KEY: &str = r"Software\AMD\CN\Audio";
 #[derive(Debug)]
@@ -35,10 +36,18 @@ pub fn executable() -> PathBuf {
         .join(r"System32\AMD\ANR\AMDNoiseSuppression.exe")
 }
 pub fn supported() -> Result<()> {
-    let bytes = std::fs::read(executable()).context("未安装 AMD Noise Suppression")?;
-    let digest = format!("{:x}", Sha256::digest(bytes));
-    if digest != PROFILE_HASH {
-        bail!("此 AMD 后台版本尚未验证，已停止私有协议写入。SHA-256: {digest}");
+    for (path, expected) in [
+        (executable(), PROFILE_HASH),
+        (executable().with_file_name("anronnxlib.dll"), ENGINE_HASH),
+    ] {
+        let bytes = std::fs::read(&path).context("未安装 AMD Noise Suppression")?;
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        if digest != expected {
+            bail!(
+                "此 AMD 组件版本尚未验证，已停止私有协议写入：{}，SHA-256: {digest}",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -86,6 +95,38 @@ pub struct Amd {
     done: Handle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
 }
+/// A passive receipt of channel startup. Reading it sends no AMD command and
+/// does not consume the completion event used by Radeon during initialization.
+/// START/SET are shared with output suppression too; these receipts confirm
+/// initialization, not the selected microphone. The next independent GET and
+/// Windows capture-session observation must still validate the pinned input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputReceipt {
+    initialized: u64,
+    started: u64,
+    selected: u64,
+    ready: bool,
+}
+impl InputReceipt {
+    pub fn confirms_reload(&self, before: &Self) -> bool {
+        self.ready
+            && self.initialized != 0
+            && self.initialized != before.initialized
+            && self.started != 0
+            && self.started != before.started
+            && self.selected != 0
+            && self.selected != before.selected
+    }
+}
+#[derive(Clone, Copy)]
+enum Request<'a> {
+    Initialize,
+    Processing(u32),
+    PinInput,
+    StartInput,
+    ReadDevice(&'a str),
+    EnableDevice(&'a str),
+}
 impl Drop for Amd {
     fn drop(&mut self) {
         unsafe {
@@ -108,7 +149,7 @@ impl Amd {
                 wide(r"Local\ANR_EVT_S").as_ptr(),
             ))?;
             let done = handle(OpenEventW(
-                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                SYNCHRONIZE,
                 0,
                 wide(r"Local\ANR_EVT_D").as_ptr(),
             ))?;
@@ -124,24 +165,39 @@ impl Amd {
             })
         }
     }
-    fn request(
-        &self,
-        device: Option<&str>,
-        enabled: Option<bool>,
-        current: impl Fn() -> bool,
-    ) -> Result<bool> {
+    pub fn input_receipt(&self) -> InputReceipt {
+        unsafe {
+            let p = self.view.Value.cast::<u8>();
+            let read_i32 = |at| ptr::read_volatile(p.add(at).cast::<i32>());
+            let read_u64 = |at| ptr::read_volatile(p.add(at).cast::<u64>());
+            InputReceipt {
+                initialized: read_u64(0x820),
+                started: read_u64(0x840),
+                selected: read_u64(0x970),
+                ready: matches!(read_i32(0x828), 0 | 1)
+                    && read_i32(0x84c) == 0
+                    && read_i32(0xa7c) == 0,
+            }
+        }
+    }
+    fn request(&self, request: Request<'_>, current: impl Fn() -> bool) -> Result<bool> {
+        let device = match request {
+            Request::ReadDevice(id) | Request::EnableDevice(id) => Some(id),
+            _ => None,
+        };
         let id = device.map(wide);
         if let Some(device) = device {
             if id.as_ref().unwrap().len() > 128 || device.is_empty() || device.contains('\0') {
                 bail!("AMD 设备 ID 超出协议范围");
             }
         }
-        let (command, offset, result) = if device.is_none() {
-            (0x82u32, 0x828, 0x828)
-        } else if enabled.is_some() {
-            (0x87u32, 0x978, 0xa7c)
-        } else {
-            (0x86, 0x868, 0x96c)
+        let (command, offset, result) = match request {
+            Request::Initialize => (0x82u32, 0x828, 0x828),
+            Request::StartInput => (0x84, 0x848, 0x84c),
+            Request::ReadDevice(_) => (0x86, 0x868, 0x96c),
+            Request::EnableDevice(_) => (0x87, 0x978, 0xa7c),
+            Request::Processing(_) => (0x89, 0xa98, 0xa9c),
+            Request::PinInput => (0x8b, 0xbb8, 0xbbc),
         };
         unsafe {
             let mutex = handle(CreateMutexW(
@@ -184,26 +240,35 @@ impl Amd {
                 ptr::write_bytes(p.add(offset), 0, 256);
                 ptr::copy_nonoverlapping(id.as_ptr().cast::<u8>(), p.add(offset), id.len() * 2);
             }
-            if let Some(state) = enabled {
-                ptr::write_volatile(p.add(offset + 256), u8::from(state));
+            match request {
+                Request::StartInput => ptr::write_volatile(p.add(offset).cast::<u32>(), 0),
+                Request::Processing(index) => {
+                    ptr::write_volatile(p.add(offset).cast::<u32>(), index)
+                }
+                Request::PinInput => ptr::write_volatile(p.add(offset), 0),
+                Request::EnableDevice(_) => ptr::write_volatile(p.add(offset + 256), 1),
+                _ => {}
             }
             ptr::write_volatile(p.add(result).cast::<i32>(), i32::MIN);
             ptr::write_volatile(p.add(offset - 8).cast::<u64>(), 0);
             ptr::write_volatile(p.add(0x818).cast::<u32>(), command);
-            // The completion event is shared; do not reset a response belonging
-            // to Radeon. Command-specific fields determine completion below.
+            // Never reset the shared event before a request: it may belong to
+            // Radeon. Validate command-specific fields before consuming ours.
             if SetEvent(self.start.0) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            // AMD's completion event is shared with Radeon Software and auto-reset.
-            // Another client may consume it, or replace the global command after
-            // our response. The command-specific completion marker + result are
-            // the authority; short bounded waits also notice a consumed event.
+            // A blocking event wait can steal Radeon's next response. Conversely,
+            // leaving our event signaled makes its next wait return stale data.
+            // Only acknowledge an already-completed, still-owned command with
+            // a zero-time wait. Never wait on the event for a future response.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
+                if ptr::read_volatile(p.add(0x818).cast::<u32>()) != command {
+                    bail!("AMD 控制请求被其他客户端占用，将稍后重试");
+                }
                 let stamped = ptr::read_volatile(p.add(offset - 8).cast::<u64>()) != 0;
                 let finished = ptr::read_volatile(p.add(result).cast::<i32>()) != i32::MIN;
-                if stamped && finished {
+                if stamped && finished && WaitForSingleObject(self.done.0, 0) == WAIT_OBJECT_0 {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
@@ -212,7 +277,7 @@ impl Amd {
                     }
                     bail!("AMD 后台响应超时，将退避后重试");
                 }
-                WaitForSingleObject(self.done.0, 50);
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
             if let Some(id) = &id {
                 let returned: Vec<_> = (0..id.len())
@@ -232,14 +297,56 @@ impl Amd {
         }
     }
     pub fn state(&self, device: &str) -> Result<bool> {
-        self.request(Some(device), None, || true)
+        // ANRonnxLib compares this ID to its active endpoints. Despite the
+        // frontend wrapper's misleading copy direction, the backend needs it
+        // as INPUT; querying an arbitrary leftover map ID is not an observation.
+        self.request(Request::ReadDevice(device), || true)
     }
     pub fn initialize(&self, current: impl Fn() -> bool) -> Result<()> {
-        self.request(None, None, current).map(|_| ())
+        self.request(Request::Initialize, current).map(|_| ())
     }
     pub fn enable(&self, device: &str, current: impl Fn() -> bool) -> Result<()> {
-        // The next observation verifies GET and live capture. Never send a
-        // second request immediately while AMD is rebuilding the input stream.
-        self.request(Some(device), Some(true), current).map(|_| ())
+        // Match Radeon's enable sequence. SET alone can leave the input channel
+        // stopped after the user selected "noise suppression off".
+        let key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY)?;
+        let processing = key.get_value::<u32, _>("ANRAudioProcessingLocation")?;
+        if processing > 2 {
+            bail!("AMD 处理器选择尚未验证：{processing}");
+        }
+        for request in [
+            Request::Initialize,
+            Request::Processing(processing),
+            Request::PinInput,
+            Request::StartInput,
+            Request::EnableDevice(device),
+        ] {
+            self.request(request, &current)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarting_radeon_without_channel_initialization_is_not_success() {
+        let before = InputReceipt {
+            initialized: 10,
+            started: 20,
+            selected: 30,
+            ready: true,
+        };
+        assert!(!before.confirms_reload(&before));
+        let mut after = before.clone();
+        after.initialized = 40;
+        assert!(!after.confirms_reload(&before));
+        after.started = 50;
+        after.selected = 60;
+        after.ready = false;
+        assert!(!after.confirms_reload(&before));
+        after.ready = true;
+        assert!(after.confirms_reload(&before));
     }
 }

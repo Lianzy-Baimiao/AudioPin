@@ -48,6 +48,7 @@ const AUTOSTART: i32 = 244;
 const MINIMIZED: i32 = 245;
 const CLOSE_TRAY: i32 = 246;
 const RESTART_AMD: i32 = 247;
+const RELOAD_AMD_PANEL: i32 = 248;
 const REPO: i32 = 250;
 const AUTH: i32 = 251;
 const AUTO_UPDATE: i32 = 252;
@@ -453,6 +454,12 @@ impl App {
         self.checkbox(CLOSE_TRAY, 3, "关闭窗口时保留托盘守护", 208);
         self.checkbox(RESTART_AMD, 3, "AMD 后台退出后自动尝试启动", 248);
         self.checkbox(NOTIFY, 3, "状态变化时显示 Windows 通知", 288);
+        self.checkbox(
+            RELOAD_AMD_PANEL,
+            3,
+            "恢复后重载 AMD 面板（会关闭 AMD 窗口）",
+            328,
+        );
         self.label(22, 3, "检查间隔 / 秒（1–60）", (264, 367, 390, 26));
         self.edit(POLL, 3, "2", (776, 362, 128, 30), ES_NUMBER as u32);
         self.label(23, 3, "修复重试上限 / 秒（5–600）", (264, 413, 390, 26));
@@ -650,6 +657,7 @@ impl App {
             (MINIMIZED, c.start_minimized),
             (CLOSE_TRAY, c.close_to_tray),
             (RESTART_AMD, c.restart_amd_if_missing),
+            (RELOAD_AMD_PANEL, c.reload_amd_panel),
             (AUTH, c.use_gh_auth),
             (AUTO_UPDATE, c.auto_check_updates),
         ] {
@@ -687,6 +695,7 @@ impl App {
         c.start_minimized = self.checked(MINIMIZED);
         c.close_to_tray = self.checked(CLOSE_TRAY);
         c.restart_amd_if_missing = self.checked(RESTART_AMD);
+        c.reload_amd_panel = self.checked(RELOAD_AMD_PANEL);
         c.use_gh_auth = self.checked(AUTH);
         c.auto_check_updates = self.checked(AUTO_UPDATE);
         c.poll_seconds = self

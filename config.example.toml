@@ -15,6 +15,9 @@ autostart = false
 start_minimized = true
 close_to_tray = true
 restart_amd_if_missing = true
+# Restart the verified Radeon control panel after recovery to reload its cache.
+# Also performs one initial synchronization. Radeon windows may close and reopen.
+reload_amd_panel = true
 # Experimental Windows per-process input preference, not app-specific integration.
 # Populate with actual process filenames only when testing compatibility.
 apps = []

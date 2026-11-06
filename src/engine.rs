@@ -52,6 +52,8 @@ pub trait Backend {
     fn current(&self) -> bool;
     fn amd_observe(&mut self, id: &str) -> Result<AmdObservation>;
     fn amd_repair(&mut self, id: &str, observed: &AmdObservation) -> Result<()>;
+    /// Reload the cached Radeon model once, then wait for its initialization.
+    fn amd_sync_panel(&mut self, input: &str) -> Result<bool>;
     fn default(&mut self, role: i32) -> Result<String>;
     fn set_default(&mut self, role: i32, id: &str) -> Result<()>;
     fn app_get(&mut self, process: &Process, role: i32) -> Result<String>;
@@ -89,6 +91,9 @@ struct Original {
 #[derive(Default)]
 pub struct Engine {
     amd: Recovery,
+    panel_synchronized: bool,
+    panel_in_progress: bool,
+    panel_retry: Backoff,
     defaults: HashMap<i32, Original>,
     apps: HashMap<(Process, i32), Original>,
     route_retry: HashMap<String, Backoff>,
@@ -114,11 +119,13 @@ impl Engine {
     }
     pub fn reset_retries(&mut self) {
         self.amd.retry.reset();
+        self.panel_retry.reset();
         self.route_retry.clear();
     }
     pub fn apply(&mut self, c: &Config) {
         if self.physical != c.physical_input || !c.amd_enabled || !c.guard_enabled {
             self.amd = Recovery::default();
+            self.panel_synchronized = false;
         }
         self.physical = c.physical_input.clone();
         self.reset_retries();
@@ -185,6 +192,26 @@ impl Engine {
         if !b.current() {
             return Health::new(State::Waiting, "正在应用新的守护设置");
         }
+        // Radeon rebuilds its model with the same single-slot ANR transport.
+        // Let its restart finish before sending any further AMD IPC requests.
+        if self.panel_in_progress {
+            match b.amd_sync_panel(&c.physical_input) {
+                Ok(false) => return Health::new(State::Repairing, "正在等待 AMD 面板重载完成"),
+                Ok(true) => {
+                    self.panel_in_progress = false;
+                    self.panel_synchronized = true;
+                    self.panel_retry.reset();
+                    events.push("AMD 面板缓存已重载，重新检查降噪运行状态".into());
+                    return Health::new(State::Repairing, "AMD 面板已重载，等待降噪状态复查");
+                }
+                Err(e) => {
+                    self.panel_in_progress = false;
+                    self.panel_retry
+                        .fail(now.max(Instant::now()), c.retry_max_seconds);
+                    return Health::error(format!("AMD 面板重载失败：{e:#}"));
+                }
+            }
+        }
         // Backoff throttles writes, never observations. A recovery is visible on
         // the next cycle even after a failed write with a long retry interval.
         let observation = match b.amd_observe(&c.physical_input) {
@@ -199,6 +226,25 @@ impl Engine {
                 capturing: true
             }
         ) {
+            if c.reload_amd_panel && !self.panel_synchronized {
+                if !self.panel_retry.ready(now) {
+                    return Health::new(State::Error, "AMD 后台已恢复，面板重载等待重试");
+                }
+                match b.amd_sync_panel(&c.physical_input) {
+                    Ok(true) => {
+                        self.panel_synchronized = true;
+                        self.panel_retry.reset();
+                        events.push("AMD 面板缓存已重载，下一周期重新检查降噪运行状态".into());
+                    }
+                    Ok(false) => self.panel_in_progress = true,
+                    Err(e) => {
+                        self.panel_retry
+                            .fail(now.max(Instant::now()), c.retry_max_seconds);
+                        return Health::error(format!("AMD 面板重载失败：{e:#}"));
+                    }
+                }
+                return Health::new(State::Repairing, "降噪后台已开启，正在重载 AMD 面板缓存");
+            }
             if self.amd.pending {
                 self.repaired += 1;
                 events
@@ -230,6 +276,7 @@ impl Engine {
         // own cooldown and cause an immediate retry storm.
         match b.amd_repair(&c.physical_input, &observation) {
             Ok(()) => {
+                self.panel_synchronized = false;
                 self.amd.pending = true;
                 self.amd.sent = Some(now.max(Instant::now()));
                 self.amd
@@ -531,6 +578,9 @@ mod tests {
         app_values: HashMap<(u32, i32), String>,
         app_writes: usize,
         cancel_during_read: bool,
+        panel_calls: usize,
+        panel_ready: bool,
+        panel_error: bool,
     }
     impl Backend for Fake {
         fn current(&self) -> bool {
@@ -544,6 +594,13 @@ mod tests {
         fn amd_repair(&mut self, _: &str, _: &AmdObservation) -> Result<()> {
             self.repairs += 1;
             Ok(())
+        }
+        fn amd_sync_panel(&mut self, _: &str) -> Result<bool> {
+            self.panel_calls += 1;
+            if self.panel_error {
+                bail!("panel reload failed");
+            }
+            Ok(self.panel_ready)
         }
         fn default(&mut self, role: i32) -> Result<String> {
             if self.cancel_during_read {
@@ -581,6 +638,7 @@ mod tests {
             output_input: "virtual".into(),
             pin_default: true,
             pin_communications: true,
+            reload_amd_panel: false,
             ..Config::default()
         };
         let devices = vec![
@@ -608,8 +666,96 @@ mod tests {
             app_values: HashMap::new(),
             app_writes: 0,
             cancel_during_read: false,
+            panel_calls: 0,
+            panel_ready: true,
+            panel_error: false,
         };
         (Engine::default(), c, devices, fake, Instant::now())
+    }
+    #[test]
+    fn healthy_backend_waits_for_panel_and_checks_again_after_reload() {
+        let (mut engine, mut c, devices, mut b, now) = setup();
+        c.reload_amd_panel = true;
+        b.observation = Some(AmdObservation::Running {
+            enabled: true,
+            configured: true,
+            capturing: true,
+        });
+        b.panel_ready = false;
+        assert_eq!(
+            engine.cycle(&c, &devices, &[], &mut b, now).amd.state,
+            State::Repairing
+        );
+        b.panel_ready = true;
+        assert_eq!(
+            engine.cycle(&c, &devices, &[], &mut b, now).amd.state,
+            State::Repairing
+        );
+        assert_eq!(
+            engine.cycle(&c, &devices, &[], &mut b, now).amd.state,
+            State::Ready
+        );
+        assert_eq!(b.panel_calls, 2);
+        assert_eq!(b.repairs, 0);
+        engine.cycle(&c, &devices, &[], &mut b, now);
+        assert_eq!(
+            b.panel_calls, 2,
+            "do not reload a healthy frontend every cycle"
+        );
+        b.observation = Some(AmdObservation::Running {
+            enabled: false,
+            configured: true,
+            capturing: false,
+        });
+        engine.cycle(&c, &devices, &[], &mut b, now);
+        b.observation = Some(AmdObservation::Running {
+            enabled: true,
+            configured: true,
+            capturing: true,
+        });
+        assert_eq!(
+            engine.cycle(&c, &devices, &[], &mut b, now).amd.state,
+            State::Repairing
+        );
+        assert_eq!(
+            engine.repaired, 0,
+            "do not count recovery before post-reload observation"
+        );
+        engine.cycle(&c, &devices, &[], &mut b, now);
+        assert_eq!(engine.repaired, 1);
+        assert_eq!(b.panel_calls, 3);
+    }
+    #[test]
+    fn panel_failure_is_not_healthy_and_retries_are_bounded() {
+        let (mut engine, mut c, devices, mut b, now) = setup();
+        c.reload_amd_panel = true;
+        b.observation = Some(AmdObservation::Running {
+            enabled: true,
+            configured: true,
+            capturing: true,
+        });
+        b.panel_error = true;
+        assert_eq!(
+            engine.cycle(&c, &devices, &[], &mut b, now).amd.state,
+            State::Error
+        );
+        engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(1));
+        assert_eq!(b.panel_calls, 1);
+        b.panel_error = false;
+        assert_eq!(
+            engine
+                .cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(3))
+                .amd
+                .state,
+            State::Repairing
+        );
+        assert_eq!(
+            engine
+                .cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(4))
+                .amd
+                .state,
+            State::Ready
+        );
     }
     #[test]
     fn amd_failure_does_not_block_any_windows_role() {

@@ -14,6 +14,7 @@ def capture_active():
  assert 'amd_capture_active' in report, 'Requires AudioPin 0.1.1 or newer diagnostics'
  return report['amd_capture_active'] is True and report['amd_runtime_enabled'] == 'true'
 assert hashlib.sha256(Path(r'C:\Windows\System32\AMD\ANR\AMDNoiseSuppression.exe').read_bytes()).hexdigest() == '4ecec1b76d9ef18c7f2a26da823e71124db627e3acd3c178c89b80b3aeac20ee', 'Unverified AMD binary; refusing IPC'
+assert hashlib.sha256(Path(r'C:\Windows\System32\AMD\ANR\anronnxlib.dll').read_bytes()).hexdigest() == 'a34a6590a14a34d4a4b4155b63bc6357ed5654414ae3c04af0f791849179ac26', 'Unverified AMD engine; refusing IPC'
 k=c.WinDLL('kernel32',use_last_error=True)
 for name,abi_args,ret in [('CreateMutexW',[c.c_void_p,c.c_bool,c.c_wchar_p],c.c_void_p),('ReleaseMutex',[c.c_void_p],c.c_bool),('OpenFileMappingW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('MapViewOfFile',[c.c_void_p,c.c_uint32,c.c_uint32,c.c_uint32,c.c_size_t],c.c_void_p),('OpenEventW',[c.c_uint32,c.c_bool,c.c_wchar_p],c.c_void_p),('SetEvent',[c.c_void_p],c.c_bool),('ResetEvent',[c.c_void_p],c.c_bool),('WaitForSingleObject',[c.c_void_p,c.c_uint32],c.c_uint32),('CloseHandle',[c.c_void_p],c.c_bool),('UnmapViewOfFile',[c.c_void_p],c.c_bool)]:
  f=getattr(k,name); f.argtypes=abi_args; f.restype=ret
@@ -34,11 +35,14 @@ try:
   c.c_int32.from_address(p+result).value=-999
   c.c_uint64.from_address(p+offset-8).value=0
   c.c_uint32.from_address(p+0x818).value=command
-  k.ResetEvent(d); assert k.SetEvent(s)
+  assert k.SetEvent(s)
   deadline=time.monotonic()+5
-  while not (c.c_uint64.from_address(p+offset-8).value and c.c_int32.from_address(p+result).value != -999):
+  while True:
+   assert c.c_uint32.from_address(p+0x818).value == command, 'Another AMD client owns the response; retry later'
+   finished = c.c_uint64.from_address(p+offset-8).value and c.c_int32.from_address(p+result).value != -999
+   if finished and k.WaitForSingleObject(d,0) == 0: break
    assert time.monotonic()<deadline, 'IPC response timed out'
-   k.WaitForSingleObject(d,50)
+   time.sleep(0.025)  # Only consume our completed response; never block on the shared event.
   assert c.string_at(p+offset,len(raw))==raw, 'IPC response device mismatch'
   print('command',hex(command),'rc',c.c_int32.from_address(p+result).value,'state',c.c_ubyte.from_address(p+offset+256).value)
   assert c.c_int32.from_address(p+result).value==0, 'IPC request failed'
