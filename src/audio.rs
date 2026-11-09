@@ -33,7 +33,14 @@ pub struct Device {
     pub name: String,
     pub active: bool,
     pub amd: bool,
+    /// Endpoint IDs this endpoint replaced, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub former_ids: Vec<String>,
 }
+/// Windows can recreate an endpoint under a new ID for the same device, e.g.
+/// during a Windows Update restart, and records the replaced IDs in this
+/// undocumented REG_MULTI_SZ property. Observed on Windows 11 build 26300.
+const FORMER_IDS: &str = "{4b416b7d-8501-40c1-acfd-97aa9bdc17c8},1";
 pub struct Audio {
     enumerator: IMMDeviceEnumerator,
 }
@@ -61,7 +68,7 @@ impl Audio {
                 CoTaskMemFree(Some(p.0.cast()));
                 let guid = id.rsplit('.').next().unwrap_or_default();
                 let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\{guid}\Properties"));
-                let name = key
+                let (name, former_ids) = key
                     .map(|k| {
                         let label: String = k
                             .get_value("{a45c254e-df1c-4efd-8020-67d146a850e0},2")
@@ -69,9 +76,13 @@ impl Audio {
                         let adapter: String = k
                             .get_value("{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
                             .unwrap_or_default();
-                        format!("{label} ({adapter})")
+                        let former: Vec<String> = k.get_value(FORMER_IDS).unwrap_or_default();
+                        (
+                            format!("{label} ({adapter})"),
+                            former.into_iter().filter(|f| !f.is_empty()).collect(),
+                        )
                     })
-                    .unwrap_or_else(|_| id.clone());
+                    .unwrap_or_else(|_| (id.clone(), Vec::new()));
                 let amd = name.to_ascii_lowercase().contains("amd streaming")
                     || name.to_ascii_lowercase().contains("amd noise");
                 result.push(Device {
@@ -79,6 +90,7 @@ impl Audio {
                     name,
                     active: d.GetState()? == DEVICE_STATE_ACTIVE,
                     amd,
+                    former_ids,
                 });
             }
             result.sort_by_key(|d| (!d.active, d.name.clone()));

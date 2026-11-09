@@ -68,7 +68,10 @@ fn entry() -> anyhow::Result<()> {
             "未查询".into()
         };
         let sessions = a.capture_sessions(&id).map_err(|e| format!("{e:#}"));
-        let amd_pids = platform::amd_process_ids()?;
+        let amd_pids: Vec<u32> = platform::amd_processes()?
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
         let capture_active = sessions.as_ref().ok().map(|sessions| {
             sessions
                 .iter()

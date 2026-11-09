@@ -1,4 +1,5 @@
 use crate::{
+    audio::Device,
     config::{data_dir, Config},
     guard::{self, Command, Shared},
     platform::{self, wide},
@@ -389,7 +390,7 @@ impl App {
         self.label(
             34,
             1,
-            "按设备标识固定。断开后等待原设备重连。",
+            "按设备标识固定，Windows 更换标识时自动跟随。断开后等待原设备重连。",
             (264, 263, 640, 24),
         );
         self.label(
@@ -724,6 +725,8 @@ impl App {
         c.output_input = self
             .selection(OUTPUT, &self.output_ids)
             .unwrap_or_else(|| c.output_input.clone());
+        // Remember the selected devices' names for display while missing.
+        c.follow_devices(&self.shared.lock().unwrap().devices);
         c.validate()?;
         Ok(c)
     }
@@ -733,6 +736,46 @@ impl App {
             None
         } else {
             ids.get(index as usize).cloned()
+        }
+    }
+    /// The remembered name of a saved device that Windows no longer lists.
+    fn remembered_name(&self, id: &str) -> Option<&str> {
+        let c = &self.config;
+        [
+            (&c.physical_input, &c.physical_input_name),
+            (&c.output_input, &c.output_input_name),
+        ]
+        .into_iter()
+        .find(|(saved, name)| *saved == id && !name.is_empty())
+        .map(|(_, name)| name.as_str())
+    }
+    /// Moves saved selections to endpoints Windows recreated and remembers
+    /// device names. Unsaved form edits stay unsaved.
+    unsafe fn follow_devices(&mut self, devices: &[Device]) {
+        let mut c = self.config.clone();
+        let followed = c.follow_devices(devices);
+        if c == self.config {
+            return;
+        }
+        if let Err(e) = c.save() {
+            let text = format!("无法保存新的设备标识：{e:#}");
+            guard::log(&mut self.shared.lock().unwrap(), &text);
+            return;
+        }
+        let moved = c.physical_input != self.config.physical_input
+            || c.output_input != self.config.output_input;
+        self.config = c;
+        let applied = if moved {
+            self.tx.send(Command::Apply(self.config.clone()))
+        } else {
+            Ok(())
+        };
+        let mut s = self.shared.lock().unwrap();
+        for text in &followed {
+            guard::log(&mut s, text);
+        }
+        if let Err(e) = applied {
+            guard::log(&mut s, &format!("{e:#}"));
         }
     }
     unsafe fn save(&mut self) -> Result<()> {
@@ -776,12 +819,10 @@ impl App {
                 .iter()
                 .find(|d| d.id == id)
                 .map(|d| format!("{}{}", if d.active { "" } else { "离线 · " }, d.name))
-                .unwrap_or_else(|| {
-                    if id.is_empty() {
-                        "尚未选择设备".into()
-                    } else {
-                        "已选设备未连接".into()
-                    }
+                .unwrap_or_else(|| match self.remembered_name(id) {
+                    _ if id.is_empty() => "尚未选择设备".into(),
+                    Some(name) => format!("未连接 · {name}"),
+                    None => "已选设备未连接".into(),
                 })
         };
         self.set(SOURCE_SUMMARY, &name(&self.config.physical_input));
@@ -820,12 +861,24 @@ impl App {
             .collect::<Vec<_>>()
             .join(";");
         if key != self.device_key || self.physical_ids.is_empty() {
-            let selected_physical = self
-                .selection(PHYSICAL, &self.physical_ids)
-                .unwrap_or_else(|| self.config.physical_input.clone());
-            let selected_output = self
-                .selection(OUTPUT, &self.output_ids)
-                .unwrap_or_else(|| self.config.output_input.clone());
+            let saved_physical = self.config.physical_input.clone();
+            let saved_output = self.config.output_input.clone();
+            self.follow_devices(&snapshot.devices);
+            // A form still showing the saved device moves with it.
+            let keep = |selected: Option<String>, saved: String, now: &str| match selected {
+                Some(selected) if selected != saved => selected,
+                _ => now.to_string(),
+            };
+            let selected_physical = keep(
+                self.selection(PHYSICAL, &self.physical_ids),
+                saved_physical,
+                &self.config.physical_input,
+            );
+            let selected_output = keep(
+                self.selection(OUTPUT, &self.output_ids),
+                saved_output,
+                &self.config.output_input,
+            );
             for (id, physical, selected) in [
                 (PHYSICAL, true, selected_physical),
                 (OUTPUT, false, selected_output),
@@ -852,13 +905,12 @@ impl App {
                 }
                 if !selected.is_empty() && !ids.contains(&selected) {
                     selection = ids.len();
-                    ids.push(selected.clone());
-                    SendMessageW(
-                        self.h(id),
-                        CB_ADDSTRING,
-                        0,
-                        wide(format!("[未连接] {selected}")).as_ptr() as isize,
+                    let label = format!(
+                        "[未连接] {}",
+                        self.remembered_name(&selected).unwrap_or(&selected)
                     );
+                    ids.push(selected);
+                    SendMessageW(self.h(id), CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
                 }
                 SendMessageW(self.h(id), CB_SETCURSEL, selection, 0);
                 if physical {

@@ -127,7 +127,7 @@ pub fn verify_process(process: &crate::engine::Process) -> Result<()> {
 }
 /// Restrict AMD identity to the installed executable in this Windows session.
 /// A filename-only match could accept another login session or a renamed EXE.
-pub fn amd_process_ids() -> Result<Vec<u32>> {
+pub fn amd_processes() -> Result<Vec<crate::engine::Process>> {
     let mut result = Vec::new();
     for (pid, name) in processes()? {
         if !name.eq_ignore_ascii_case("AMDNoiseSuppression.exe") || !in_current_session(pid) {
@@ -150,7 +150,11 @@ pub fn amd_process_ids() -> Result<Vec<u32>> {
         if String::from_utf16_lossy(&path[..len as usize])
             .eq_ignore_ascii_case(&crate::amd::executable().to_string_lossy())
         {
-            result.push(pid);
+            result.push(crate::engine::Process {
+                pid,
+                name,
+                started: started(&process)?,
+            });
         }
     }
     Ok(result)

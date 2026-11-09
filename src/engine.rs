@@ -48,9 +48,34 @@ pub enum AmdObservation {
         capturing: bool,
     },
 }
+impl AmdObservation {
+    fn healthy(&self) -> bool {
+        matches!(
+            self,
+            Self::Running {
+                enabled: true,
+                configured: true,
+                capturing: true
+            }
+        )
+    }
+}
+/// AMD state that can be read without sending AMD a request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AmdPassive {
+    /// Verified backend processes. A restart changes the creation time.
+    pub backends: Vec<Process>,
+    /// Registry: runtime switch on, input pinned to the selected microphone.
+    pub configured: bool,
+    /// A backend process has an active Windows capture session on it.
+    pub capturing: bool,
+}
 pub trait Backend {
     fn current(&self) -> bool;
-    fn amd_observe(&mut self, id: &str) -> Result<AmdObservation>;
+    fn amd_passive(&mut self, id: &str) -> Result<AmdPassive>;
+    /// Query AMD's runtime switch for `id`; None while its engine is
+    /// uninitialized. AMD logs every request to the Windows event log.
+    fn amd_query(&mut self, id: &str) -> Result<Option<bool>>;
     fn amd_repair(&mut self, id: &str, observed: &AmdObservation) -> Result<()>;
     /// Reload the cached Radeon model once, then wait for its initialization.
     fn amd_sync_panel(&mut self, input: &str) -> Result<bool>;
@@ -83,6 +108,8 @@ struct Recovery {
     sent: Option<Instant>,
     retry: Backoff,
 }
+/// How long a sent recovery may take to start capturing before another write.
+const RECOVERY_SETTLE: Duration = Duration::from_secs(8);
 #[derive(Clone)]
 struct Original {
     before: String,
@@ -91,6 +118,9 @@ struct Original {
 #[derive(Default)]
 pub struct Engine {
     amd: Recovery,
+    /// Passive signals and the AMD observation (or query error) last made
+    /// with them.
+    amd_seen: Option<(AmdPassive, Result<AmdObservation, String>)>,
     panel_synchronized: bool,
     panel_in_progress: bool,
     panel_retry: Backoff,
@@ -117,10 +147,12 @@ impl Engine {
         }
         names
     }
-    pub fn reset_retries(&mut self) {
+    /// Retry failed writes now and query AMD again on the next cycle.
+    pub fn recheck(&mut self) {
         self.amd.retry.reset();
         self.panel_retry.reset();
         self.route_retry.clear();
+        self.amd_seen = None;
     }
     pub fn apply(&mut self, c: &Config) {
         if self.physical != c.physical_input || !c.amd_enabled || !c.guard_enabled {
@@ -128,7 +160,7 @@ impl Engine {
             self.panel_synchronized = false;
         }
         self.physical = c.physical_input.clone();
-        self.reset_retries();
+        self.recheck();
     }
     pub fn cycle(
         &mut self,
@@ -151,6 +183,7 @@ impl Engine {
             };
             if physical_state(&key) != physical_state(&self.device_key) {
                 self.amd.retry.reset();
+                self.amd_seen = None;
             }
             self.route_retry.clear();
             self.device_key = key;
@@ -195,37 +228,73 @@ impl Engine {
         // Radeon rebuilds its model with the same single-slot ANR transport.
         // Let its restart finish before sending any further AMD IPC requests.
         if self.panel_in_progress {
+            // A reload restarts Radeon, which talks to the backend itself.
+            // Whatever its outcome, observe the backend afresh afterwards.
             match b.amd_sync_panel(&c.physical_input) {
                 Ok(false) => return Health::new(State::Repairing, "正在等待 AMD 面板重载完成"),
                 Ok(true) => {
                     self.panel_in_progress = false;
                     self.panel_synchronized = true;
                     self.panel_retry.reset();
+                    self.amd_seen = None;
                     events.push("AMD 面板缓存已重载，重新检查降噪运行状态".into());
                     return Health::new(State::Repairing, "AMD 面板已重载，等待降噪状态复查");
                 }
                 Err(e) => {
                     self.panel_in_progress = false;
+                    self.amd_seen = None;
                     self.panel_retry
                         .fail(now.max(Instant::now()), c.retry_max_seconds);
                     return Health::error(format!("AMD 面板重载失败：{e:#}"));
                 }
             }
         }
-        // Backoff throttles writes, never observations. A recovery is visible on
-        // the next cycle even after a failed write with a long retry interval.
-        let observation = match b.amd_observe(&c.physical_input) {
-            Ok(o) => o,
-            Err(e) => return Health::error(format!("AMD 检查失败：{e:#}")),
-        };
-        if matches!(
-            observation,
-            AmdObservation::Running {
-                enabled: true,
-                configured: true,
-                capturing: true
+        // AMD logs every request it receives to the Windows Application log;
+        // a GET per poll added about 3,600 entries an hour. Passive signals are
+        // read every cycle; AMD is queried again only when they change, a write
+        // is due, or a fresh check was requested. Backoff still throttles
+        // writes, never observations: a recovery changes the capture session
+        // and is queried and confirmed in that cycle.
+        let passive = match b.amd_passive(&c.physical_input) {
+            Ok(p) => p,
+            Err(e) => {
+                self.amd_seen = None;
+                return Health::error(format!("AMD 检查失败：{e:#}"));
             }
-        ) {
+        };
+        let write_due = !self.amd_settling(now) && self.amd.retry.ready(now);
+        let observed = match self.amd_seen.take() {
+            Some((seen, observed))
+                if seen == passive
+                    && (observed.as_ref().is_ok_and(AmdObservation::healthy) || !write_due) =>
+            {
+                observed
+            }
+            _ if passive.backends.is_empty() => Ok(AmdObservation::Missing),
+            _ => match b.amd_query(&c.physical_input) {
+                Ok(None) => Ok(AmdObservation::Initializing),
+                Ok(Some(enabled)) => Ok(AmdObservation::Running {
+                    enabled,
+                    configured: passive.configured,
+                    capturing: passive.capturing,
+                }),
+                Err(e) => {
+                    // A failed request can still reach AMD's log. Retry it on
+                    // the write backoff, not every cycle; changed signals
+                    // still query at once.
+                    self.amd
+                        .retry
+                        .fail(now.max(Instant::now()), c.retry_max_seconds);
+                    Err(format!("{e:#}"))
+                }
+            },
+        };
+        self.amd_seen = Some((passive, observed.clone()));
+        let observation = match observed {
+            Ok(observation) => observation,
+            Err(e) => return Health::error(format!("AMD 检查失败：{e}")),
+        };
+        if observation.healthy() {
             if c.reload_amd_panel && !self.panel_synchronized {
                 if !self.panel_retry.ready(now) {
                     return Health::new(State::Error, "AMD 后台已恢复，面板重载等待重试");
@@ -234,6 +303,7 @@ impl Engine {
                     Ok(true) => {
                         self.panel_synchronized = true;
                         self.panel_retry.reset();
+                        self.amd_seen = None;
                         events.push("AMD 面板缓存已重载，下一周期重新检查降噪运行状态".into());
                     }
                     Ok(false) => self.panel_in_progress = true,
@@ -256,11 +326,7 @@ impl Engine {
         if matches!(observation, AmdObservation::Missing) && !c.restart_amd_if_missing {
             return Health::error("AMD 后台未运行，自动启动已关闭");
         }
-        if self
-            .amd
-            .sent
-            .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(8))
-        {
+        if self.amd_settling(now) {
             return Health::new(State::Repairing, "已请求恢复，正在等待 AMD 建立采集会话");
         }
         if !self.amd.retry.ready(now) {
@@ -292,6 +358,12 @@ impl Engine {
                 Health::error(format!("AMD 恢复失败：{e:#}"))
             }
         }
+    }
+    /// A sent recovery may still be starting AMD's capture session.
+    fn amd_settling(&self, now: Instant) -> bool {
+        self.amd
+            .sent
+            .is_some_and(|t| now.saturating_duration_since(t) < RECOVERY_SETTLE)
     }
     fn routes(
         &mut self,
@@ -569,6 +641,9 @@ mod tests {
     use super::*;
     struct Fake {
         observation: Option<AmdObservation>,
+        backend_started: u64,
+        queries: usize,
+        query_error: bool,
         defaults: [String; 3],
         writes: Vec<i32>,
         fail_read: bool,
@@ -586,10 +661,47 @@ mod tests {
         fn current(&self) -> bool {
             self.current
         }
-        fn amd_observe(&mut self, _: &str) -> Result<AmdObservation> {
-            self.observation
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("unsupported AMD"))
+        fn amd_passive(&mut self, _: &str) -> Result<AmdPassive> {
+            let backend = Process {
+                pid: 7,
+                name: "AMDNoiseSuppression.exe".into(),
+                started: self.backend_started,
+            };
+            let observation = self
+                .observation
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("unsupported AMD"))?;
+            Ok(match *observation {
+                AmdObservation::Missing => AmdPassive {
+                    backends: vec![],
+                    configured: false,
+                    capturing: false,
+                },
+                AmdObservation::Initializing => AmdPassive {
+                    backends: vec![backend],
+                    configured: true,
+                    capturing: false,
+                },
+                AmdObservation::Running {
+                    configured,
+                    capturing,
+                    ..
+                } => AmdPassive {
+                    backends: vec![backend],
+                    configured,
+                    capturing,
+                },
+            })
+        }
+        fn amd_query(&mut self, _: &str) -> Result<Option<bool>> {
+            self.queries += 1;
+            if self.query_error {
+                bail!("AMD 后台响应超时");
+            }
+            Ok(match self.observation {
+                Some(AmdObservation::Running { enabled, .. }) => Some(enabled),
+                _ => None,
+            })
         }
         fn amd_repair(&mut self, _: &str, _: &AmdObservation) -> Result<()> {
             self.repairs += 1;
@@ -647,16 +759,21 @@ mod tests {
                 name: "USB".into(),
                 active: true,
                 amd: false,
+                former_ids: vec![],
             },
             Device {
                 id: "virtual".into(),
                 name: "AMD".into(),
                 active: true,
                 amd: true,
+                former_ids: vec![],
             },
         ];
         let fake = Fake {
             observation: None,
+            backend_started: 1,
+            queries: 0,
+            query_error: false,
             defaults: ["old".into(), "old".into(), "old".into()],
             writes: vec![],
             fail_read: false,
@@ -806,6 +923,7 @@ mod tests {
             name: "second".into(),
             active: true,
             amd: false,
+            former_ids: vec![],
         });
         c.output_input = "new-target".into();
         b.fail_write = Some(2);
@@ -851,6 +969,90 @@ mod tests {
             State::Ready
         );
         assert_eq!(engine.repaired, 1);
+    }
+    #[test]
+    fn steady_backend_is_queried_only_when_passive_signals_change() {
+        // Every AMD request becomes a Windows Application log entry.
+        let (mut engine, c, devices, mut b, now) = setup();
+        b.observation = Some(AmdObservation::Running {
+            enabled: true,
+            configured: true,
+            capturing: true,
+        });
+        for second in 0..30 {
+            let at = now + Duration::from_secs(second);
+            let cycle = engine.cycle(&c, &devices, &[], &mut b, at);
+            assert_eq!(cycle.amd.state, State::Ready);
+        }
+        assert_eq!(b.queries, 1);
+        b.backend_started = 2;
+        engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(31));
+        assert_eq!(b.queries, 2, "a restarted backend is queried again");
+        engine.recheck();
+        engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(32));
+        assert_eq!(b.queries, 3, "a manual check queries again");
+        b.observation = Some(AmdObservation::Running {
+            enabled: false,
+            configured: true,
+            capturing: false,
+        });
+        let cycle = engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(33));
+        assert_eq!(
+            (cycle.amd.state, b.queries, b.repairs),
+            (State::Repairing, 4, 1)
+        );
+    }
+    #[test]
+    fn unchanged_failure_is_queried_again_only_before_the_next_write() {
+        let (mut engine, c, devices, mut b, now) = setup();
+        b.observation = Some(AmdObservation::Running {
+            enabled: false,
+            configured: true,
+            capturing: false,
+        });
+        engine.cycle(&c, &devices, &[], &mut b, now);
+        assert_eq!((b.queries, b.repairs), (1, 1));
+        for second in 1..8 {
+            let at = now + Duration::from_secs(second);
+            let cycle = engine.cycle(&c, &devices, &[], &mut b, at);
+            assert_eq!(cycle.amd.state, State::Repairing);
+        }
+        assert_eq!((b.queries, b.repairs), (1, 1));
+        engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(9));
+        assert_eq!((b.queries, b.repairs), (2, 2));
+    }
+    #[test]
+    fn missing_backend_is_never_queried() {
+        let (mut engine, mut c, devices, mut b, now) = setup();
+        c.restart_amd_if_missing = false;
+        b.observation = Some(AmdObservation::Missing);
+        for second in 0..5 {
+            let at = now + Duration::from_secs(second);
+            let cycle = engine.cycle(&c, &devices, &[], &mut b, at);
+            assert_eq!(cycle.amd.state, State::Error);
+        }
+        assert_eq!((b.queries, b.repairs), (0, 0));
+    }
+    #[test]
+    fn failing_query_backs_off_instead_of_repeating_every_cycle() {
+        let (mut engine, c, devices, mut b, now) = setup();
+        b.observation = Some(AmdObservation::Running {
+            enabled: true,
+            configured: true,
+            capturing: true,
+        });
+        b.query_error = true;
+        for second in 0..10 {
+            let at = now + Duration::from_secs(second);
+            let cycle = engine.cycle(&c, &devices, &[], &mut b, at);
+            assert_eq!(cycle.amd.state, State::Error);
+        }
+        // Retried only as the 2 s, then 4 s backoff expires; not 10 times.
+        assert_eq!((b.queries, b.repairs), (3, 0));
+        b.query_error = false;
+        engine.recheck();
+        let cycle = engine.cycle(&c, &devices, &[], &mut b, now + Duration::from_secs(10));
+        assert_eq!((cycle.amd.state, b.queries), (State::Ready, 4));
     }
     #[test]
     fn pending_new_configuration_prevents_old_writes() {

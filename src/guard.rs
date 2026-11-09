@@ -2,7 +2,7 @@ use crate::{
     amd,
     audio::{AppPolicy, Audio, Com, Device},
     config::{data_dir, Config},
-    engine::{AmdObservation, Backend, Engine, Process, State},
+    engine::{AmdObservation, AmdPassive, Backend, Engine, Process, State},
     platform,
 };
 use anyhow::{bail, Context, Result};
@@ -94,37 +94,47 @@ impl WindowsBackend<'_> {
         }
         Ok(())
     }
+    fn check_profile(&self) -> Result<()> {
+        if let Some(e) = self.profile_error {
+            bail!("{e}");
+        }
+        Ok(())
+    }
 }
 impl Backend for WindowsBackend<'_> {
     fn current(&self) -> bool {
         self.generation.load(Ordering::SeqCst) == self.revision
     }
-    fn amd_observe(&mut self, id: &str) -> Result<AmdObservation> {
-        if let Some(e) = self.profile_error {
-            bail!("{e}");
+    fn amd_passive(&mut self, id: &str) -> Result<AmdPassive> {
+        self.check_profile()?;
+        let backends = platform::amd_processes()?;
+        if backends.is_empty() {
+            return Ok(AmdPassive {
+                backends,
+                configured: false,
+                capturing: false,
+            });
         }
-        let pids = platform::amd_process_ids()?;
-        if pids.is_empty() {
-            return Ok(AmdObservation::Missing);
-        }
-        let ipc = amd::Amd::connect()?;
-        let enabled = match ipc.state(id) {
-            Ok(state) => state,
-            Err(e) if amd::uninitialized(&e) => return Ok(AmdObservation::Initializing),
-            Err(e) => return Err(e),
-        };
         let configured =
             amd::configured_on()? && amd::input_is_pinned()? && amd::configured_input() == id;
         let capturing = self
             .audio
             .capture_sessions(id)?
             .iter()
-            .any(|s| s.active && pids.contains(&s.process_id));
-        Ok(AmdObservation::Running {
-            enabled,
+            .any(|s| s.active && backends.iter().any(|p| p.pid == s.process_id));
+        Ok(AmdPassive {
+            backends,
             configured,
             capturing,
         })
+    }
+    fn amd_query(&mut self, id: &str) -> Result<Option<bool>> {
+        self.check_profile()?;
+        match amd::Amd::connect()?.state(id) {
+            Ok(enabled) => Ok(Some(enabled)),
+            Err(e) if amd::uninitialized(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
     fn amd_repair(&mut self, id: &str, observed: &AmdObservation) -> Result<()> {
         self.check_current()?;
@@ -137,7 +147,7 @@ impl Backend for WindowsBackend<'_> {
             AmdObservation::Missing => {
                 // A concurrently started verified backend should be observed on
                 // the next cycle, not launched a second time.
-                if platform::amd_process_ids()?.is_empty() {
+                if platform::amd_processes()?.is_empty() {
                     platform::hidden_command(amd::executable())
                         .arg("NoQuit")
                         .current_dir(amd::executable().parent().context("AMD 安装目录无效")?)
@@ -235,14 +245,14 @@ fn run(
                     revision = next;
                     engine.apply(&config);
                 }
-                Command::Check => engine.reset_retries(),
+                Command::Check => engine.recheck(),
             }
         }
         let current_stamp = profile_stamp();
         if current_stamp != stamp {
             profile_error = amd::supported().err().map(|e| format!("{e:#}"));
             stamp = current_stamp;
-            engine.reset_retries();
+            engine.recheck();
         }
         let devices_result = (|| -> Result<Vec<Device>> {
             if audio.is_none() {

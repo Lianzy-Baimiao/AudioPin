@@ -1,10 +1,16 @@
 # Copy settings via the UI, or edit %LOCALAPPDATA%\AudioPin\config.toml then reload.
 # Device IDs are machine-specific. Select actual devices in the UI.
+# When Windows recreates an endpoint under a new ID (e.g. during a Windows Update
+# restart), it records the replaced ID; AudioPin follows only that record and
+# saves the new ID.
+# The *_name fields are display names kept for a device Windows no longer lists.
 schema_version = 1
 guard_enabled = true
 amd_enabled = true
 physical_input = ""
+physical_input_name = ""
 output_input = ""
+output_input_name = ""
 pin_default = false
 pin_communications = false
 poll_seconds = 2
