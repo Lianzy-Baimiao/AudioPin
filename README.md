@@ -51,7 +51,8 @@ Rust 编写的 Windows 原生音频守护工具，重点解决 AMD 麦克风降�
 .\AudioPin.exe --background       # 按设置启动到托盘
 .\AudioPin.exe --diagnose         # 输出并写入 diagnostics.json
 .\AudioPin.exe --check-update     # 检查并写入 update-check.txt
-.\AudioPin.exe --self-test-routing # 对自身 PID 测试应用路由并还原；默认设备幂等写入测试
+.\AudioPin.exe --self-test-routing [PID] # 对指定（默认自身）PID 测试应用路由并还原；默认设备幂等写入测试
+.\AudioPin.exe --clear-app-routing PID  # 把运行中应用的 Windows 输入偏好恢复为“默认”
 ```
 
 Release 为 Windows GUI 子系统；PowerShell 直接启动可能不等待。自动化使用 `Start-Process -Wait`，CLI 结果同时写入配置目录。开发版可直接查看控制台输出。

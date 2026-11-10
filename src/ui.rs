@@ -188,6 +188,9 @@ pub fn run(config: Config, background: bool) -> Result<()> {
         state.load_fields();
         state.page(0);
         state.layout();
+        // Hide focus rectangles until the keyboard is used (UIS_SET,
+        // UISF_HIDEFOCUS); Windows shows them again on keyboard navigation.
+        SendMessageW(hwnd, WM_CHANGEUISTATE, 1 | (1 << 16), 0);
         SetTimer(hwnd, 1, 500, None);
         if !background || !state.config.start_minimized || !state.tray_ok {
             ShowWindow(hwnd, SW_SHOW);
@@ -204,6 +207,7 @@ pub fn run(config: Config, background: bool) -> Result<()> {
             }
         }
         let state = app.borrow();
+        guard::log(&mut state.shared.lock().unwrap(), "AudioPin 已退出");
         state.tray(NIM_DELETE, None);
         let _ = state.tx.send(Command::Stop);
         let _ = worker.join();
@@ -1264,7 +1268,9 @@ unsafe fn window_message(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<L
                 DT_SINGLELINE | DT_VCENTER | if nav { DT_LEFT } else { DT_CENTER },
             );
             SelectObject(draw.hDC, old);
-            if draw.itemState & ODS_FOCUS != 0 && draw.itemState & ODS_NOFOCUSRECT == 0 {
+            // Navigation already shows its selection; a dotted XOR focus
+            // rectangle on its tinted fill looks like a stray red frame.
+            if !nav && draw.itemState & ODS_FOCUS != 0 && draw.itemState & ODS_NOFOCUSRECT == 0 {
                 InflateRect(&mut rect, -px(4), -px(4));
                 DrawFocusRect(draw.hDC, &rect);
             }
@@ -1329,6 +1335,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
     let Ok(mut app) = cell.try_borrow_mut() else {
         // Programmatic control updates send nested notifications. Their state
         // is already being applied by the outer call and must not be replayed.
+        // Default WM_CLOSE handling destroys the window and would bypass the
+        // close-to-tray setting; retry it once the outer call has returned.
+        if msg == WM_CLOSE {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
         return DefWindowProcW(hwnd, msg, w, l);
     };
     match msg {
@@ -1340,6 +1352,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         WM_TIMER => {
+            // At login the taskbar may not accept the icon yet.
+            if !app.tray_ok {
+                app.tray_ok = app.tray(NIM_ADD, None);
+            }
             app.refresh();
             0
         }
@@ -1449,6 +1465,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             0
         }
-        _ => DefWindowProcW(hwnd, msg, w, l),
+        _ => {
+            // DefWindowProc sends follow-up messages synchronously, e.g. the
+            // title bar's SC_CLOSE becomes WM_CLOSE. Release App first so they
+            // reach their handlers instead of the default (destroy) behavior.
+            drop(app);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
     }
 }

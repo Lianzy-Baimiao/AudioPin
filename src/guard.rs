@@ -188,7 +188,11 @@ impl Backend for WindowsBackend<'_> {
     }
     fn app_get(&mut self, process: &Process, role: i32) -> Result<String> {
         platform::verify_process(process)?;
-        AppPolicy::new()?.get(process.pid, role)
+        // Windows rejects console processes (e.g. ping.exe) with
+        // E_INVALIDARG here; GUI processes such as explorer.exe work.
+        AppPolicy::new()?
+            .get(process.pid, role)
+            .context("Windows 不接受此进程的输入偏好，控制台程序或尚未使用音频的进程常见此情况")
     }
     fn app_set(&mut self, process: &Process, role: i32, id: &str) -> Result<()> {
         self.check_current()?;

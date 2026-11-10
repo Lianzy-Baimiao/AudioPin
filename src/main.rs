@@ -8,11 +8,15 @@ mod platform;
 mod ui;
 mod updates;
 
+use anyhow::Context;
+
 fn main() {
     if let Err(e) = entry() {
         let text = format!("{e:#}");
         eprintln!("{text}");
-        if !std::env::args().any(|a| a == "--diagnose" || a == "--check-update") {
+        if !std::env::args()
+            .any(|a| a == "--diagnose" || a == "--check-update" || a == "--clear-app-routing")
+        {
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                     std::ptr::null_mut(),
@@ -28,22 +32,43 @@ fn main() {
 fn entry() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let mut c = config::Config::load()?;
-    if args.iter().any(|a| a == "--self-test-routing") {
+    if let Some(at) = args.iter().position(|a| a == "--self-test-routing") {
         let _com = audio::Com::init()?;
         let audio = audio::Audio::new()?;
         let policy = audio::AppPolicy::new()?;
-        let pid = std::process::id();
+        // Optional target PID; defaults to this process.
+        let pid = match args.get(at + 1) {
+            Some(p) => p.parse().context("PID 无效")?,
+            None => std::process::id(),
+        };
         let id = audio::AppPolicy::full_id(&audio.default(1)?);
         for role in [0, 1, 2] {
-            let original = policy.get(pid, role)?;
-            let test = policy.set_raw(pid, role, &id);
-            let restore = policy.set_raw(pid, role, &original);
+            let original = policy.get(pid, role).context("读取偏好失败")?;
+            let test = policy.set_raw(pid, role, &id).context("写入偏好失败");
+            let restore = policy.set_raw(pid, role, &original).context("还原偏好失败");
             test?;
             restore?;
-            println!("PASS: self PID {pid}, capture role {role}: set / readback / restore");
+            println!("PASS: PID {pid}, capture role {role}: set / readback / restore");
             let default = audio.default(role)?;
             audio.set_default(&default, role)?;
             println!("PASS: default capture role {role}: idempotent set / readback");
+        }
+        return Ok(());
+    }
+    // Windows keeps app input preferences after AudioPin exits and only
+    // accepts a live PID. Reset one app to "default" for every capture role.
+    if let Some(at) = args.iter().position(|a| a == "--clear-app-routing") {
+        let pid: u32 = args
+            .get(at + 1)
+            .context("用法：--clear-app-routing <PID>")?
+            .parse()
+            .context("PID 无效")?;
+        let _com = audio::Com::init()?;
+        let policy = audio::AppPolicy::new()?;
+        for role in [0, 1, 2] {
+            let before = policy.get(pid, role)?;
+            policy.set_raw(pid, role, "")?;
+            println!("PID {pid}, capture role {role}: [{before}] -> default");
         }
         return Ok(());
     }
