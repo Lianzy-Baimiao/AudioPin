@@ -45,6 +45,14 @@ pub struct Control {
     generation: Arc<AtomicU64>,
 }
 impl Control {
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        Self {
+            tx: mpsc::channel().0,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     pub fn send(&self, command: Command) -> Result<()> {
         let generation = if matches!(command, Command::Check) {
             self.generation.load(Ordering::SeqCst)

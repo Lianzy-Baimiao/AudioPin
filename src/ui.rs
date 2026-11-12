@@ -24,6 +24,8 @@ fn resource(id: u16) -> *const u16 {
     id as usize as *const u16
 }
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+#[cfg(test)]
+mod tests;
 const TRAY: u32 = WM_APP + 1;
 const SHOW: u32 = WM_APP + 2;
 const PAUSE: i32 = 201;
@@ -1397,6 +1399,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             0
         }
         SHOW => {
+            // Restoring sends WM_SIZE synchronously. Let that callback borrow
+            // App and align the controls with the restored client rectangle.
+            drop(app);
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
             0
@@ -1404,6 +1409,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
         TRAY => {
             match l as u32 {
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                    drop(app);
                     ShowWindow(hwnd, SW_RESTORE);
                     SetForegroundWindow(hwnd);
                 }
